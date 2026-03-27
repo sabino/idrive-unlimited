@@ -26,20 +26,26 @@ When the embedded login reaches the authenticated IDrive home page, the gateway 
 
 ## Build
 
-The core EVS client and WebDAV bridge build normally:
+There are two practical build modes:
 
-```powershell
-go build ./...
+- headless build: `serve`, `probe`, and `smoke` work, but `login` is disabled
+- full build: includes the native embedded login window
+
+Headless build:
+
+```text
+CGO_ENABLED=0 go build -o idrive-gateway ./cmd/idrive-gateway
 ```
 
-The native embedded login requires `cgo` plus a working GCC-compatible C/C++ toolchain:
+Full build:
 
-```powershell
-$env:CGO_ENABLED='1'
-go build ./...
+```text
+CGO_ENABLED=1 go build -o idrive-gateway ./cmd/idrive-gateway
 ```
 
 If you build without `cgo`, `login` returns a clear error, but `probe` and `serve` still work when a valid EVS session file already exists.
+
+Because `login` uses `webview_go`, full builds are easiest when performed on the target OS rather than cross-compiling from another OS.
 
 Preferred Windows build command:
 
@@ -116,6 +122,45 @@ Notes:
 - The final binary should not require the compiler toolchain on the target machine.
 - The login command does require WebView2 on the machine where you run it.
 - Go's `cgo` on Windows expects a GCC-compatible compiler; `cl.exe` is not sufficient for this project.
+
+## Linux build notes
+
+Linux full builds need:
+
+- Go 1.26+
+- a C/C++ compiler such as `gcc` or `clang`
+- `pkg-config`
+- GTK 3 development headers
+- WebKitGTK development headers
+
+Generic build command:
+
+```bash
+CGO_ENABLED=1 go build -o idrive-gateway ./cmd/idrive-gateway
+```
+
+On Debian/Ubuntu-like systems, the package names are typically:
+
+```bash
+sudo apt-get install -y build-essential pkg-config libgtk-3-dev libwebkit2gtk-4.1-dev
+```
+
+Some distros package WebKitGTK as `4.0` instead of `4.1`; the upstream `webview` library supports either runtime family.
+
+## macOS build notes
+
+macOS full builds need:
+
+- Go 1.26+
+- Xcode Command Line Tools
+
+Generic build command:
+
+```bash
+CGO_ENABLED=1 go build -o idrive-gateway ./cmd/idrive-gateway
+```
+
+The native login uses the system WebKit framework on macOS, so there is no extra browser runtime to install.
 
 ## Commands
 
