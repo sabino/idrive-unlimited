@@ -162,6 +162,21 @@ CGO_ENABLED=1 go build -o idrive-gateway ./cmd/idrive-gateway
 
 The native login uses the system WebKit framework on macOS, so there is no extra browser runtime to install.
 
+## CI and Releases
+
+GitHub Actions now validates the project in two different ways:
+
+- headless test/build jobs on Windows, Linux, and macOS with `CGO_ENABLED=0`
+- native CGO build verification on Windows, Linux, and macOS so the embedded login path keeps compiling on real runners
+
+Releases are published with GoReleaser when a tag matching `v*` is pushed.
+
+Important release note:
+
+- GoReleaser publishes portable headless binaries with `CGO_ENABLED=0`
+- the embedded `login` webview flow is validated in CI through native builds, but the release artifacts themselves are headless for portability
+- if you want a binary with the embedded login window, build it natively on the target OS using the instructions above
+
 ## Commands
 
 ```text

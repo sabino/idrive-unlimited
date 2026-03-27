@@ -1,0 +1,129 @@
+name: release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  verify-native-linux:
+    name: Verify Native Build (Linux)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Install native build dependencies
+        shell: bash
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential pkg-config libgtk-3-dev libwebkit2gtk-4.1-dev
+
+      - name: Build CGO binary
+        shell: bash
+        env:
+          CGO_ENABLED: "1"
+        run: |
+          mkdir -p dist
+          go build -o dist/idrive-gateway ./cmd/idrive-gateway
+          ./dist/idrive-gateway version
+
+  verify-native-macos:
+    name: Verify Native Build (macOS)
+    runs-on: macos-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Build CGO binary
+        shell: bash
+        env:
+          CGO_ENABLED: "1"
+        run: |
+          mkdir -p dist
+          go build -o dist/idrive-gateway ./cmd/idrive-gateway
+          ./dist/idrive-gateway version
+
+  verify-native-windows:
+    name: Verify Native Build (Windows)
+    runs-on: windows-latest
+    steps:
+      - name: Disable CRLF conversion
+        run: git config --global core.autocrlf input
+
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Set up MSYS2 toolchain
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: UCRT64
+          update: true
+          install: >-
+            mingw-w64-ucrt-x86_64-toolchain
+
+      - name: Add UCRT64 toolchain to PATH
+        shell: powershell
+        run: |
+          "C:\msys64\ucrt64\bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+
+      - name: Build CGO binary
+        shell: powershell
+        run: |
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          $env:CC = "gcc"
+          $env:CXX = "g++"
+          $env:CGO_ENABLED = "1"
+          go build -o .\dist\idrive-gateway.exe .\cmd\idrive-gateway
+          Copy-Item C:\msys64\ucrt64\bin\libstdc++-6.dll .\dist\
+          Copy-Item C:\msys64\ucrt64\bin\libgcc_s_seh-1.dll .\dist\
+          Copy-Item C:\msys64\ucrt64\bin\libwinpthread-1.dll .\dist\
+          .\dist\idrive-gateway.exe version
+
+  goreleaser:
+    name: Publish Release
+    runs-on: ubuntu-latest
+    needs:
+      - verify-native-linux
+      - verify-native-macos
+      - verify-native-windows
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Run GoReleaser
+        uses: goreleaser/goreleaser-action@v6
+        with:
+          version: "~> v2"
+          args: release --clean
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
