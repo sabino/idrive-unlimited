@@ -10,5 +10,5 @@ import (
 )
 
 func Login(context.Context) (*session.Data, error) {
-	return nil, fmt.Errorf("native embedded login requires CGO-enabled builds; rebuild with CGO_ENABLED=1 on Windows or Linux to use the lightweight webview auth flow")
+	return nil, fmt.Errorf("native embedded login requires a CGO-enabled build; rebuild with CGO_ENABLED=1 on Windows, macOS, or Linux to use the lightweight webview auth flow")
 }

@@ -79,7 +79,7 @@ Usage:
 
 Notes:
   - login opens a lightweight native webview instead of bundling Electron.
-  - Windows uses WebView2. Linux uses the system WebKitGTK runtime used by webview_go.
+  - Windows uses WebView2. macOS uses the system WebKit framework. Linux uses the system WebKitGTK runtime used by webview_go.
   - serve listens on loopback only; use stock "rclone webdav" against it.
 `)
 }
