@@ -25,6 +25,12 @@ import (
 	netwebdav "golang.org/x/net/webdav"
 )
 
+var (
+	version = "dev"
+	commit  = "none"
+	date    = "unknown"
+)
+
 func main() {
 	log.SetFlags(0)
 
@@ -45,6 +51,9 @@ func main() {
 		err = runSmoke(ctx, os.Args[2:])
 	case "serve":
 		err = runServe(ctx, os.Args[2:])
+	case "version":
+		printVersion()
+		return
 	case "help", "-h", "--help":
 		usage()
 		return
@@ -66,6 +75,7 @@ Usage:
   idrive-gateway probe [--config PATH] [--root /] [--scratch /.idrive-gateway-probe] [--json]
   idrive-gateway smoke [--config PATH] [--root /] [--mount-drive X:]
   idrive-gateway serve [--config PATH] [--root /] [--listen 127.0.0.1:8787] [--dav-user idrive] [--dav-pass PASS]
+  idrive-gateway version
 
 Notes:
   - login opens a lightweight native webview instead of bundling Electron.
@@ -283,4 +293,8 @@ func printProbeReport(report *probe.Report) {
 	}
 	fmt.Println()
 	fmt.Println("Probe failed.")
+}
+
+func printVersion() {
+	fmt.Printf("idrive-gateway version=%s commit=%s date=%s\n", version, commit, date)
 }
