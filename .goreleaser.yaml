@@ -25,7 +25,7 @@ builds:
 archives:
   - id: default
     name_template: >-
-      {{ .ProjectName }}_{{ .Version }}_{{- if eq .Os "darwin" }}macOS{{- else }}{{ .Os }}{{- end }}_{{ .Arch }}
+      {{ .ProjectName }}_{{ .Version }}_{{- if eq .Os "darwin" }}macOS{{- else }}{{ .Os }}{{- end }}_{{ .Arch }}_headless
     formats: [tar.gz]
     format_overrides:
       - goos: windows
@@ -35,7 +35,7 @@ archives:
       - README.md
 
 checksum:
-  name_template: checksums.txt
+  name_template: checksums-headless.txt
 
 snapshot:
   version_template: "{{ incpatch .Version }}-next"
@@ -56,5 +56,6 @@ release:
   prerelease: auto
   footer: |
     Notes:
-    - GoReleaser publishes portable headless binaries with `CGO_ENABLED=0`.
-    - The embedded `login` webview flow is validated in CI via native CGO builds on Windows, Linux, and macOS, but release artifacts themselves are built headless for portability.
+    - `_headless` archives are portable binaries built with `CGO_ENABLED=0`; they do not include the embedded `login` webview flow.
+    - `_native` archives and Windows setup installers are uploaded by GitHub Actions from CGO-enabled builds and include `login` support on supported platforms.
+    - macOS native artifacts are unsigned and should be treated as experimental until validated on more real machines.

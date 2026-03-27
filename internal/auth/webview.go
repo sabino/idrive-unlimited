@@ -32,6 +32,9 @@ type tokenLoginPayload struct {
 }
 
 func Login(ctx context.Context) (*session.Data, error) {
+	if err := ensureNativeLoginRuntime(); err != nil {
+		return nil, err
+	}
 	payload, err := waitForTokenLogin(ctx)
 	if err != nil {
 		return nil, err

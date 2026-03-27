@@ -24,6 +24,30 @@ That avoids Electron and avoids storing the user password in this utility.
 
 When the embedded login reaches the authenticated IDrive home page, the gateway calls `/idrive/home/getTokenLogin`, exchanges that token for its own EVS session, and then uses that EVS session for all API traffic.
 
+## Download and install
+
+Each GitHub release publishes two artifact families:
+
+- `_headless` archives: portable `CGO_ENABLED=0` binaries for scripting, `serve`, `probe`, and `smoke`
+- `_native` archives: CGO-enabled builds that support the embedded `login` flow
+
+Recommended download path:
+
+- Windows: `idrive-gateway-setup_<version>_windows_amd64.exe`
+- Linux: `idrive-gateway_<version>_linux_amd64_native.tar.gz`
+- macOS: `idrive-gateway_<version>_macOS_<arch>_native.tar.gz`
+
+Windows also ships a portable native zip:
+
+- `idrive-gateway_<version>_windows_amd64_native.zip`
+
+Notes:
+
+- Windows native downloads include the required MinGW runtime DLLs.
+- The Windows installer bootstraps WebView2 automatically if it is missing.
+- Linux native downloads still rely on system GTK3/WebKitGTK packages.
+- macOS native downloads are unsigned for now and should be treated as experimental.
+
 ## Build
 
 There are two practical build modes:
@@ -60,6 +84,12 @@ That script:
 - builds `idrive-gateway.exe`
 - copies the required MinGW runtime DLLs next to the exe
 
+Native Windows release packaging command:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\package-windows-native.ps1 -Version 0.1.0 -RequireInstaller
+```
+
 ## Windows prerequisites
 
 On Windows there are two separate dependency buckets:
@@ -69,7 +99,7 @@ On Windows there are two separate dependency buckets:
 
 The compiler is not a runtime dependency. You install it to build the binary, not to run the finished binary.
 
-Recommended build setup on Windows:
+Recommended build setup on Windows when building from source:
 
 - Install a GCC-compatible Windows toolchain such as MSYS2 MinGW-w64/UCRT64
 - Make sure `gcc.exe` and `g++.exe` are available on `PATH`
@@ -109,7 +139,7 @@ Or just use the repo-local build script:
 powershell -ExecutionPolicy Bypass -File .\scripts\build-windows.ps1 -PersistGoEnv -VerboseEnv
 ```
 
-For the login window itself, install or verify WebView2:
+For source builds, install or verify WebView2:
 
 ```powershell
 winget install --id Microsoft.EdgeWebView2Runtime
@@ -122,6 +152,7 @@ Notes:
 - The final binary should not require the compiler toolchain on the target machine.
 - The login command does require WebView2 on the machine where you run it.
 - Go's `cgo` on Windows expects a GCC-compatible compiler; `cl.exe` is not sufficient for this project.
+- The Windows installer/native zip bundles the Microsoft Evergreen WebView2 bootstrapper so users do not have to install WebView2 manually first.
 
 ## Linux build notes
 
@@ -147,6 +178,12 @@ sudo apt-get install -y build-essential pkg-config libgtk-3-dev libwebkit2gtk-4.
 
 Some distros package WebKitGTK as `4.0` instead of `4.1`; the upstream `webview` library supports either runtime family.
 
+Native Linux release packaging command:
+
+```bash
+bash ./scripts/package-native-posix.sh --version 0.1.0 --os-label linux --arch-label amd64
+```
+
 ## macOS build notes
 
 macOS full builds need:
@@ -162,20 +199,29 @@ CGO_ENABLED=1 go build -o idrive-gateway ./cmd/idrive-gateway
 
 The native login uses the system WebKit framework on macOS, so there is no extra browser runtime to install.
 
+Native macOS release packaging command:
+
+```bash
+bash ./scripts/package-native-posix.sh --version 0.1.0 --os-label macOS --arch-label "$(uname -m | sed 's/x86_64/amd64/;s/arm64/arm64/')"
+```
+
 ## CI and Releases
 
 GitHub Actions now validates the project in two different ways:
 
 - headless test/build jobs on Windows, Linux, and macOS with `CGO_ENABLED=0`
-- native CGO build verification on Windows, Linux, and macOS so the embedded login path keeps compiling on real runners
+- native packaging jobs on Windows, Linux, and macOS so the embedded login path keeps compiling and the downloadable artifacts stay runnable
+- Windows installer smoke tests in CI
+- GoReleaser snapshot jobs for the headless release path
 
 Releases are published with GoReleaser when a tag matching `v*` is pushed.
 
 Important release note:
 
-- GoReleaser publishes portable headless binaries with `CGO_ENABLED=0`
-- the embedded `login` webview flow is validated in CI through native builds, but the release artifacts themselves are headless for portability
-- if you want a binary with the embedded login window, build it natively on the target OS using the instructions above
+- GoReleaser publishes the `_headless` assets
+- GitHub Actions uploads the `_native` assets and the Windows setup installer to the same GitHub release
+- native assets are the correct downloads when you want `login` to work out of the box
+- macOS native assets are currently unsigned and should be treated as experimental
 
 ## Commands
 

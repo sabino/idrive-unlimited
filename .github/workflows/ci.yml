@@ -14,6 +14,7 @@ permissions:
 
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+  CI_NATIVE_VERSION: "0.0.0-ci"
 
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
@@ -78,8 +79,8 @@ jobs:
         shell: bash
         run: ./idrive-gateway version || ./idrive-gateway.exe version
 
-  native-linux:
-    name: Native Build (Linux)
+  native-package-linux:
+    name: Native Package (Linux amd64)
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -96,21 +97,42 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y build-essential pkg-config libgtk-3-dev libwebkit2gtk-4.1-dev
 
-      - name: Build CGO binary
+      - name: Build native package
         shell: bash
-        env:
-          CGO_ENABLED: "1"
         run: |
-          mkdir -p dist
-          mkdir -p "$RUNNER_TEMP/pkgconfig"
-          cp /usr/lib/x86_64-linux-gnu/pkgconfig/webkit2gtk-4.1.pc "$RUNNER_TEMP/pkgconfig/webkit2gtk-4.0.pc"
-          export PKG_CONFIG_PATH="$RUNNER_TEMP/pkgconfig${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}"
-          go build -o dist/idrive-gateway ./cmd/idrive-gateway
-          ./dist/idrive-gateway version
+          build_date="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
+          bash ./scripts/package-native-posix.sh \
+            --version "${CI_NATIVE_VERSION}" \
+            --commit "${GITHUB_SHA}" \
+            --build-date "${build_date}" \
+            --artifact-dir "./dist-native" \
+            --os-label "linux" \
+            --arch-label "amd64"
 
-  native-macos:
-    name: Native Build (macOS)
-    runs-on: macos-latest
+      - name: Smoke test packaged binary
+        shell: bash
+        run: |
+          mkdir -p smoke
+          tar -C smoke -xzf "dist-native/idrive-gateway_${CI_NATIVE_VERSION}_linux_amd64_native.tar.gz"
+          ./smoke/idrive-gateway_${CI_NATIVE_VERSION}_linux_amd64_native/idrive-gateway version
+
+      - name: Upload native artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: native-linux-amd64
+          path: dist-native/idrive-gateway_${{ env.CI_NATIVE_VERSION }}_linux_amd64_native.tar.gz
+
+  native-package-macos:
+    name: Native Package (macOS ${{ matrix.arch_label }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-13
+            arch_label: amd64
+          - runner: macos-14
+            arch_label: arm64
     steps:
       - name: Checkout
         uses: actions/checkout@v6
@@ -120,17 +142,33 @@ jobs:
         with:
           go-version-file: go.mod
 
-      - name: Build CGO binary
+      - name: Build native package
         shell: bash
-        env:
-          CGO_ENABLED: "1"
         run: |
-          mkdir -p dist
-          go build -o dist/idrive-gateway ./cmd/idrive-gateway
-          ./dist/idrive-gateway version
+          build_date="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
+          bash ./scripts/package-native-posix.sh \
+            --version "${CI_NATIVE_VERSION}" \
+            --commit "${GITHUB_SHA}" \
+            --build-date "${build_date}" \
+            --artifact-dir "./dist-native" \
+            --os-label "macOS" \
+            --arch-label "${{ matrix.arch_label }}"
 
-  native-windows:
-    name: Native Build (Windows)
+      - name: Smoke test packaged binary
+        shell: bash
+        run: |
+          mkdir -p smoke
+          tar -C smoke -xzf "dist-native/idrive-gateway_${CI_NATIVE_VERSION}_macOS_${{ matrix.arch_label }}_native.tar.gz"
+          ./smoke/idrive-gateway_${CI_NATIVE_VERSION}_macOS_${{ matrix.arch_label }}_native/idrive-gateway version
+
+      - name: Upload native artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: native-macos-${{ matrix.arch_label }}
+          path: dist-native/idrive-gateway_${{ env.CI_NATIVE_VERSION }}_macOS_${{ matrix.arch_label }}_native.tar.gz
+
+  native-package-windows:
+    name: Native Package (Windows amd64)
     runs-on: windows-latest
     steps:
       - name: Disable CRLF conversion
@@ -158,19 +196,46 @@ jobs:
         run: |
           "${{ steps.msys2.outputs.msys2-location }}\ucrt64\bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
 
-      - name: Build CGO binary
+      - name: Install Inno Setup
+        shell: powershell
+        run: choco install innosetup --no-progress -y
+
+      - name: Build native package
         shell: powershell
         run: |
-          New-Item -ItemType Directory -Force -Path dist | Out-Null
-          $toolchainBin = "${{ steps.msys2.outputs.msys2-location }}\ucrt64\bin"
-          $env:CC = "gcc"
-          $env:CXX = "g++"
-          $env:CGO_ENABLED = "1"
-          go build -o .\dist\idrive-gateway.exe .\cmd\idrive-gateway
-          Copy-Item (Join-Path $toolchainBin "libstdc++-6.dll") .\dist\
-          Copy-Item (Join-Path $toolchainBin "libgcc_s_seh-1.dll") .\dist\
-          Copy-Item (Join-Path $toolchainBin "libwinpthread-1.dll") .\dist\
-          .\dist\idrive-gateway.exe version
+          $buildDate = [DateTime]::UtcNow.ToString("yyyy-MM-ddTHH:mm:ssZ")
+          powershell -ExecutionPolicy Bypass -File .\scripts\package-windows-native.ps1 `
+            -Version "${env:CI_NATIVE_VERSION}" `
+            -Commit "${env:GITHUB_SHA}" `
+            -BuildDate $buildDate `
+            -ArtifactDir ".\dist-native" `
+            -RequireInstaller
+
+      - name: Smoke test packaged zip
+        shell: powershell
+        run: |
+          $zipPath = ".\dist-native\idrive-gateway_${env:CI_NATIVE_VERSION}_windows_amd64_native.zip"
+          $extractDir = ".\smoke-zip"
+          if (Test-Path $extractDir) { Remove-Item $extractDir -Recurse -Force }
+          Expand-Archive -Path $zipPath -DestinationPath $extractDir
+          .\smoke-zip\idrive-gateway_${env:CI_NATIVE_VERSION}_windows_amd64_native\idrive-gateway.exe version
+
+      - name: Smoke test installer
+        shell: powershell
+        run: |
+          $installer = ".\dist-native\idrive-gateway-setup_${env:CI_NATIVE_VERSION}_windows_amd64.exe"
+          $installDir = Join-Path $env:RUNNER_TEMP "idrive-gateway-install"
+          if (Test-Path $installDir) { Remove-Item $installDir -Recurse -Force }
+          Start-Process -FilePath $installer -ArgumentList "/VERYSILENT","/SUPPRESSMSGBOXES","/NORESTART","/DIR=$installDir" -Wait
+          & (Join-Path $installDir "idrive-gateway.exe") version
+
+      - name: Upload native artifacts
+        uses: actions/upload-artifact@v7
+        with:
+          name: native-windows-amd64
+          path: |
+            dist-native/idrive-gateway_${{ env.CI_NATIVE_VERSION }}_windows_amd64_native.zip
+            dist-native/idrive-gateway-setup_${{ env.CI_NATIVE_VERSION }}_windows_amd64.exe
 
   goreleaser-snapshot:
     name: GoReleaser Snapshot
@@ -178,9 +243,9 @@ jobs:
     needs:
       - format-and-vet
       - unit-tests
-      - native-linux
-      - native-macos
-      - native-windows
+      - native-package-linux
+      - native-package-macos
+      - native-package-windows
     steps:
       - name: Checkout
         uses: actions/checkout@v6
