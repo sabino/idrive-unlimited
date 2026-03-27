@@ -159,7 +159,8 @@ jobs:
           $extractDir = ".\smoke-zip"
           if (Test-Path $extractDir) { Remove-Item $extractDir -Recurse -Force }
           Expand-Archive -Path $zipPath -DestinationPath $extractDir
-          .\smoke-zip\idrive-gateway_${version}_windows_amd64_native\idrive-gateway.exe version
+          $binary = Join-Path $extractDir "idrive-gateway_${version}_windows_amd64_native\idrive-gateway.exe"
+          & $binary version
 
       - name: Smoke test installer
         shell: powershell
