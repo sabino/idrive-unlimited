@@ -217,8 +217,8 @@ Notes:
 - The `serve` process must stay running while you use the remote or the mount.
 - If you start `serve` without `--dav-user` and `--dav-pass`, it prints generated credentials; use those with the setup script or with `rclone config create`.
 - You only need to create the `rclone` remote once unless the local WebDAV URL or credentials change.
-- Windows convenience helper: [setup-rclone.ps1](/C:/Users/felip/code/sabino/idrive-unlimited/scripts/setup-rclone.ps1)
-- POSIX shell helper for Linux/macOS: [setup-rclone.sh](/C:/Users/felip/code/sabino/idrive-unlimited/scripts/setup-rclone.sh)
+- Windows convenience helper: `scripts/setup-rclone.ps1`
+- POSIX shell helper for Linux/macOS: `scripts/setup-rclone.sh`
 
 ## Notes
 
@@ -232,4 +232,4 @@ Notes:
 - Device pseudo-folders such as `Contacts`, `Calendar`, `Call Logs`, and `SMS` are exposed read-only.
 - Device-backed top-level roots are exposed with friendly names and their root names are not renamable.
 
-See [docs/rclone.md](/C:/Users/felip/code/sabino/idrive-unlimited/docs/rclone.md) for `rclone` usage.
+See `docs/rclone.md` for `rclone` usage.
