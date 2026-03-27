@@ -129,7 +129,7 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - runner: macos-13
+          - runner: macos-15
             arch_label: amd64
           - runner: macos-14
             arch_label: arm64
@@ -209,6 +209,7 @@ jobs:
             -Commit "${env:GITHUB_SHA}" `
             -BuildDate $buildDate `
             -ArtifactDir ".\dist-native" `
+            -ToolchainBin "${{ steps.msys2.outputs.msys2-location }}\ucrt64\bin" `
             -RequireInstaller
 
       - name: Smoke test packaged zip

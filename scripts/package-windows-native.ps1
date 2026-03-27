@@ -4,16 +4,26 @@ param(
     [string]$BuildDate = "",
     [string]$ArtifactDir = ".\\dist-native",
     [string]$BootstrapperUrl = "https://go.microsoft.com/fwlink/p/?LinkId=2124703",
+    [string]$ToolchainBin = "",
     [string]$InnoSetupCompiler = "",
     [switch]$RequireInstaller
 )
 
 $ErrorActionPreference = "Stop"
 
-function Resolve-MsysToolchainBin {
+function Resolve-MsysToolchainBin([string]$explicitPath) {
+    if (-not [string]::IsNullOrWhiteSpace($explicitPath)) {
+        if ((Test-Path (Join-Path $explicitPath "gcc.exe")) -and (Test-Path (Join-Path $explicitPath "g++.exe"))) {
+            return $explicitPath
+        }
+        throw "The provided MSYS2 toolchain path does not contain gcc.exe and g++.exe: $explicitPath"
+    }
+
     $candidates = @(
         "C:\msys64\ucrt64\bin",
-        "C:\msys64\mingw64\bin"
+        "C:\msys64\mingw64\bin",
+        "D:\a\_temp\msys64\ucrt64\bin",
+        "D:\a\_temp\msys64\mingw64\bin"
     )
 
     foreach ($candidate in $candidates) {
@@ -91,7 +101,7 @@ if (Test-Path $stageDir) {
 }
 New-Item -ItemType Directory -Force -Path $stageDir | Out-Null
 
-$toolchainBin = Resolve-MsysToolchainBin
+$toolchainBin = Resolve-MsysToolchainBin $ToolchainBin
 Ensure-PathContains $toolchainBin
 $env:CC = "gcc"
 $env:CXX = "g++"
