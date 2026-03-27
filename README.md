@@ -126,6 +126,55 @@ idrive-gateway smoke --root /
 idrive-gateway serve --root / --listen 127.0.0.1:8787
 ```
 
+## Quick start with rclone
+
+If you already built the binary and logged in once, the shortest cross-platform path is:
+
+1. Validate the account and write path:
+
+```text
+idrive-gateway probe --root /
+```
+
+2. Start the local WebDAV bridge with fixed credentials so your `rclone` remote stays stable:
+
+```text
+idrive-gateway serve --root / --listen 127.0.0.1:8787 --dav-user idrive --dav-pass localtest123
+```
+
+3. In another shell, create or update the `rclone` remote with plain `rclone`:
+
+```text
+rclone obscure localtest123
+rclone config create idrive-local webdav url http://127.0.0.1:8787 vendor other user idrive pass <obscured-password>
+```
+
+4. Test it:
+
+```text
+rclone lsd idrive-local:
+rclone ls idrive-local:
+```
+
+5. Mount it:
+
+```text
+Windows:
+rclone mount idrive-local: X: --network-mode --vfs-cache-mode full --dir-cache-time 30m --attr-timeout 1m --poll-interval 0 --no-modtime
+
+Linux/macOS:
+rclone mount idrive-local: /mnt/idrive --vfs-cache-mode full --dir-cache-time 30m --attr-timeout 1m --poll-interval 0 --no-modtime
+```
+
+Notes:
+
+- The `rclone` remote points to your local gateway, not directly to IDrive.
+- The `serve` process must stay running while you use the remote or the mount.
+- If you start `serve` without `--dav-user` and `--dav-pass`, it prints generated credentials; use those with the setup script or with `rclone config create`.
+- You only need to create the `rclone` remote once unless the local WebDAV URL or credentials change.
+- Windows convenience helper: [setup-rclone.ps1](/C:/Users/felip/code/sabino/idrive-unlimited/scripts/setup-rclone.ps1)
+- POSIX shell helper for Linux/macOS: [setup-rclone.sh](/C:/Users/felip/code/sabino/idrive-unlimited/scripts/setup-rclone.sh)
+
 ## Notes
 
 - Small uploads and chunked uploads are both implemented from the live browser traffic.
@@ -136,5 +185,6 @@ idrive-gateway serve --root / --listen 127.0.0.1:8787
 - `smoke` starts an in-process loopback WebDAV bridge and runs real `rclone webdav` commands against it.
 - `smoke --mount-drive X:` also validates a temporary Windows drive mount through `rclone mount`.
 - Device pseudo-folders such as `Contacts`, `Calendar`, `Call Logs`, and `SMS` are exposed read-only.
+- Device-backed top-level roots are exposed with friendly names and their root names are not renamable.
 
 See [docs/rclone.md](/C:/Users/felip/code/sabino/idrive-unlimited/docs/rclone.md) for `rclone` usage.

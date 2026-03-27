@@ -1,5 +1,40 @@
 # rclone usage
 
+## Fast path
+
+If you want the shortest working setup:
+
+1. Start the gateway with fixed local WebDAV credentials:
+
+```text
+idrive-gateway serve --root / --listen 127.0.0.1:8787 --dav-user idrive --dav-pass localtest123
+```
+
+2. In another shell, create the `rclone` remote with plain `rclone`:
+
+```text
+rclone obscure localtest123
+rclone config create idrive-local webdav url http://127.0.0.1:8787 vendor other user idrive pass <obscured-password>
+```
+
+3. Test it:
+
+```text
+rclone lsd idrive-local:
+```
+
+4. Mount it:
+
+```text
+Windows:
+rclone mount idrive-local: X: --network-mode --vfs-cache-mode full --dir-cache-time 30m --attr-timeout 1m --poll-interval 0 --no-modtime
+
+Linux/macOS:
+rclone mount idrive-local: /mnt/idrive --vfs-cache-mode full --dir-cache-time 30m --attr-timeout 1m --poll-interval 0 --no-modtime
+```
+
+The `serve` process must stay running while `rclone` uses the remote.
+
 ## 1. Login
 
 ```powershell
@@ -36,6 +71,18 @@ Non-interactive:
 
 ```powershell
 rclone config create idrive-local webdav url http://127.0.0.1:8787 vendor other user idrive pass <obscured-password>
+```
+
+Helper script:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\setup-rclone.ps1 -RemoteName idrive-local -Url http://127.0.0.1:8787 -User idrive -Password localtest123
+```
+
+POSIX helper:
+
+```bash
+./scripts/setup-rclone.sh --remote-name idrive-local --url http://127.0.0.1:8787 --user idrive --password localtest123
 ```
 
 ## 5. Common commands
