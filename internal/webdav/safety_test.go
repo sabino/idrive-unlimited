@@ -3,6 +3,7 @@ package idrivewebdav
 import (
 	"bytes"
 	"context"
+	"encoding/xml"
 	"errors"
 	"io"
 	"net/http"
@@ -210,5 +211,53 @@ func TestCancellationFinishesOwnerCleanupBeforeReturning(t *testing.T) {
 	})
 	if len(remaining) != 0 {
 		t.Fatalf("temporary files left after cancellation: %v", remaining)
+	}
+}
+
+func TestEmptyDirectoryPROPFIND(t *testing.T) {
+	s := testevs.New(t)
+	s.Directory("/empty")
+	c, _ := evs.NewClient(s.Host, nil)
+	h := NewHandler(New(c, "/"), nil)
+	r := httptest.NewRequest("PROPFIND", "http://gateway/empty/", nil)
+	r.Header.Set("Depth", "1")
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, r)
+	if w.Code != 207 {
+		t.Fatalf("empty PROPFIND returned HTTP %d: %s", w.Code, w.Body.String())
+	}
+	var result struct {
+		Responses []struct {
+			Href string `xml:"href"`
+		} `xml:"response"`
+	}
+	if err := xml.Unmarshal(w.Body.Bytes(), &result); err != nil {
+		t.Fatal(err)
+	}
+	if len(result.Responses) != 1 || result.Responses[0].Href != "/empty/" {
+		t.Fatalf("unexpected directory listing: %+v", result.Responses)
+	}
+}
+
+func TestDirectoryReaddirEndSemantics(t *testing.T) {
+	for _, size := range []int{0, 1} {
+		entries := make([]evs.Node, size)
+		if size > 0 {
+			entries[0] = evs.Node{Path: "/file", Name: "file"}
+		}
+		dir := newDirFile(fileInfo{}, entries, nil)
+		got, err := dir.Readdir(-1)
+		if err != nil || len(got) != size {
+			t.Fatalf("initial listing size=%d got=%d err=%v", size, len(got), err)
+		}
+		for _, count := range []int{-1, 0} {
+			got, err = dir.Readdir(count)
+			if err != nil || len(got) != 0 {
+				t.Fatalf("exhausted Readdir(%d) = %v, %v", count, got, err)
+			}
+		}
+		if _, err := dir.Readdir(1); !errors.Is(err, io.EOF) {
+			t.Fatalf("positive Readdir at end: %v", err)
+		}
 	}
 }
