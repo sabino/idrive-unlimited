@@ -2,6 +2,8 @@
 
 The gateway can mount IDrive read/write. Run `login` once, then reuse the saved session with `serve --no-login`; this fails with a useful error instead of opening a browser when authentication is unavailable. `probe` and `smoke` also support `--no-login` for unattended checks.
 
+See the [recovery and reliability review](reliability-review-2026-10-27.md) for persistent transaction recovery, cookie refresh, cache isolation and request limits.
+
 ## Uploads and recovery
 
 The web upload limit is enforced conservatively at 2,000,000,000 bytes, before remote changes. Oversized WebDAV PUT requests return HTTP 413. A failed or incomplete incoming request is discarded without committing its partial body.
@@ -10,17 +12,20 @@ Each complete upload is staged at a unique remote name and downloaded for a size
 
 EVS does not provide a demonstrated atomic replacement operation. Gateway requests are serialized around mutations so its readers do not see the backup/promotion window. External IDrive clients can briefly see the destination absent. A promotion failure triggers rollback when the destination is confirmed missing. If the server's outcome cannot be established, the gateway preserves recovery files and reports their paths rather than deleting uncertain bytes. Concurrent modifications from another gateway or the IDrive website cannot be made transactional by this local process.
 
-Complete local uploads that fail to save are retained under the user cache directory in `idrive-gateway/recovery`. The error includes the recovery filename; its adjacent JSON file records the intended remote path. These files contain private uploaded content. The default retention budget is 4 GiB and seven days, pruned when recovery storage is used. Override the location with `IDRIVE_GATEWAY_RECOVERY_DIR` and the byte budget with `IDRIVE_GATEWAY_RECOVERY_MAX_BYTES`. If retention itself fails, the error identifies the staging/recovery file that remains.
+Complete local uploads that fail to save are retained under the user cache directory in `idrive-gateway/recovery`. The error includes the recovery filename; its adjacent JSON file records the intended remote path. These files contain private uploaded content. The default retention budget is 4 GiB and seven days, pruned when recovery storage is used. Override the base location with `IDRIVE_GATEWAY_RECOVERY_DIR` (managed files use its `idrive-gateway-recovery` child) and the byte budget with `IDRIVE_GATEWAY_RECOVERY_MAX_BYTES`. If retention itself fails, the error identifies the staging/recovery file that remains.
 
 Ordinary WebDAV COPY/MOVE operations reject an existing target with HTTP 412. Stock rclone 1.75.2 can separately DELETE the target before MOVE, bypassing that guard. For mounting, use the [verified companion](verified-mount.md): it negotiates `X-IDrive-Safe-Move: verified-copy-v1`, skips rclone's pre-delete and leaves replacement to the gateway. Explicit DELETE still deletes data.
 
-A negotiated file MOVE downloads the source to a private temporary file, uses the staged SHA-256-verified upload transaction for the target, then rechecks the source before removing it. Both same-directory and cross-directory replacement are supported up to the upload limit. Existing directory targets are rejected. A failed upload retains the source; uncertain upstream outcomes retain remote recovery files. A crash or failed source removal can leave duplicates, and an error after promotion can mean the destination was saved while the source remains. Inspect the reported paths before retrying. EVS has no conditional deletion or cross-client lock, so concurrent external edits and fully atomic remote POSIX rename semantics remain unsupported.
+A negotiated file MOVE preserves an existing target under a unique backup name, uses EVS's native full-path rename, verifies the resulting bytes with SHA-256, and then removes the verified backup. It never separately DELETEs the source path, so an external writer recreating that path cannot have its new file deleted by cleanup. Native renames do not upload content and do not use the 2 GB web-upload limit. Directory moves also use the single native rename operation, avoiding intermediate-basename collisions; existing directory targets remain unsupported.
+
+An uncertain outcome retains the journal and backup. Restart reconciles completed renames or restores the old target when the source is still verified. A canonical source or destination is never deleted by move-journal cleanup. EVS still has no conditional mutation or cross-client lock, so external writers and fully atomic remote POSIX behavior remain outside this process's guarantees. Large remote renames require checksum readback and remain subject to transfer timeouts; multi-gigabyte live renames have not been exercised.
+
 
 ## Download cache
 
 The persistent cache is separated by a SHA-256 session identity and mounted root. Reusing the same session reuses downloads; a different authenticated session cannot reuse another account's cached bytes.
 
-The default cache target is 4 GiB with seven days of inactivity, pruned on access. Set `IDRIVE_GATEWAY_CACHE_DIR` for the location and `IDRIVE_GATEWAY_CACHE_MAX_BYTES` for the budget. The currently requested file is protected from eviction; a file larger than the budget can temporarily exceed it, and open files can delay eviction on Windows. Limit rclone's VFS cache separately, for example `--vfs-cache-max-size 4G`, because the two caches store separate copies.
+The default cache target is 4 GiB with seven days of inactivity, pruned on access. Set `IDRIVE_GATEWAY_CACHE_DIR` for the base location (managed files use its `idrive-gateway-files` child) and `IDRIVE_GATEWAY_CACHE_MAX_BYTES` for the budget. The currently requested file is protected from eviction; a file larger than the budget can temporarily exceed it, and open files can delay eviction on Windows. Limit rclone's VFS cache separately, for example `--vfs-cache-max-size 4G`, because the two caches store separate copies.
 
 Reads are still downloaded completely before local seeking. Request cancellation now reaches downloads, waiting callers can cancel independently, and download transfers have a 30-minute limit instead of the metadata client's two-minute limit. Range streaming requires separate validation against EVS and is not claimed by this change.
 

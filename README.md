@@ -254,31 +254,33 @@ idrive-gateway probe --root /
 idrive-gateway serve --root / --listen 127.0.0.1:8787 --dav-user idrive --dav-pass-file /private/path/password
 ```
 
-3. In another shell, create or update the `rclone` remote with plain `rclone`:
+3. Configure a dedicated private remote (Python 3.9+ and rclone are required):
 
-```text
-rclone obscure - < /private/path/password
-rclone config create idrive-local webdav url http://127.0.0.1:8787 vendor other user idrive pass <obscured-password>
+```sh
+bash scripts/setup-rclone.sh --password-file /private/path/password \
+  --config /private/path/idrive-rclone.conf
 ```
 
-4. Test it:
+On Windows, use `scripts/setup-rclone.ps1 -PasswordFile C:\private\password.txt -Config C:\private\idrive-rclone.conf`.
+The helpers preserve other remotes and configure the filename encoding needed by IDrive.
 
-```text
-rclone lsd idrive-local:
-rclone ls idrive-local:
+4. Build the [verified companion](docs/verified-mount.md), then test the remote:
+
+```sh
+idrive-rclone --config /private/path/idrive-rclone.conf lsd idrive-local:
 ```
 
-5. For a writable mount with replacement-rename protection, build and use the [verified companion](docs/verified-mount.md). Stock rclone remains usable for ordinary commands; its rename-overwrite path can pre-delete a destination.
+5. Mount the verified Linux profile:
 
-Stock mount examples (see the companion guide before using writable mounts):
-
-```text
-Windows:
-rclone mount idrive-local: X: --network-mode --vfs-cache-mode full --dir-cache-time 30m --attr-timeout 1m --poll-interval 0 --no-modtime
-
-Linux/macOS:
-rclone mount idrive-local: /mnt/idrive --vfs-cache-mode full --dir-cache-time 30m --attr-timeout 1m --poll-interval 0 --no-modtime
+```sh
+idrive-rclone --config /private/path/idrive-rclone.conf mount idrive-local: /mnt/idrive \
+  --vfs-cache-mode full --vfs-cache-max-size 4G --dir-cache-time 30s \
+  --attr-timeout 1s --poll-interval 0 --no-modtime
 ```
+
+The companion must be used for replacement-rename protection. Its FUSE behavior is
+verified on Linux; see the [platform boundaries](docs/reliability-review-2026-10-27.md#provider-and-platform-boundaries)
+for Windows/macOS status.
 
 Notes:
 
@@ -304,3 +306,5 @@ Notes:
 See `docs/rclone.md` for `rclone` usage.
 
 See [write safety and local operation](docs/safety.md) for verified replacement behavior, recovery copies, cache limits, unattended session reuse, and writable mounts.
+
+For the current recovery behavior, security fixes, validation scope and provider limits, see [the reliability review](docs/reliability-review-2026-10-27.md). The setup helpers write a dedicated private rclone config and accept password files; pass their printed config path via `--config`.

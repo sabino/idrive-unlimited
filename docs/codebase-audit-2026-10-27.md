@@ -2,7 +2,7 @@
 
 Remediation update: the subsequent safety change addresses the seven reproduced defects and the additional concrete maintenance issues. See [write safety and local operation](safety.md) for the resulting behavior and remaining service limits. The findings and baseline results below describe revision `df08f6b`, before those fixes. The reproduction patch is a historical fixture for that revision; current regression tests live alongside the implementation.
 
-The current Linux build works with the authenticated IDrive account: native login, EVS operations, rclone WebDAV operations, and an actual FUSE mount all passed. It still has important write-safety and cache-isolation defects. I recommend using the mount read-only until the first three findings below are fixed.
+At the audited revision, the Linux build worked with the authenticated IDrive account: native login, EVS operations, rclone WebDAV operations, and an actual FUSE mount all passed. That revision had write-safety and cache-isolation defects and was kept read-only. The subsequent fixes and current behavior are described in the linked safety and reliability reviews.
 
 Reviewed revision: `df08f6b`. Application source and dependencies were left unchanged. This report and the accompanying reproduction patch are the only repository additions.
 

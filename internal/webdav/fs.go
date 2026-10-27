@@ -2,6 +2,7 @@ package idrivewebdav
 
 import (
 	"context"
+	"crypto/sha256"
 	"errors"
 	"fmt"
 	"io"
@@ -48,6 +49,7 @@ func (f *FileSystem) OpenFile(ctx context.Context, name string, flag int, _ os.F
 		if err != nil {
 			return nil, mapError("open", name, err)
 		}
+		file.cache = f.cache
 		return file, nil
 	}
 
@@ -55,11 +57,14 @@ func (f *FileSystem) OpenFile(ctx context.Context, name string, flag int, _ os.F
 	if err != nil {
 		return nil, mapError("open", name, err)
 	}
-	info := infoFromNode(node, name)
+	info := f.info(node, name)
 	if node.IsDir {
 		children, err := f.client.Browse(ctx, remote)
 		if err != nil {
 			return nil, mapError("open", name, err)
+		}
+		for i := range children {
+			children[i].Version += "|" + f.client.Revision()
 		}
 		return newDirFile(info, children, func(node evs.Node) string {
 			return f.exposedPath(ctx, node.Path)
@@ -79,10 +84,16 @@ func (f *FileSystem) RemoveAll(ctx context.Context, name string) error {
 		// destination here; MoveReplace owns its verified replacement instead.
 		return nil
 	}
+	if err := f.cache.invalidateAll(); err != nil {
+		return err
+	}
 	return mapError("remove", name, f.client.Delete(ctx, f.remotePath(ctx, name)))
 }
 
 func (f *FileSystem) Rename(ctx context.Context, oldName, newName string) error {
+	if err := f.cache.invalidateAll(); err != nil {
+		return err
+	}
 	if f.root == "/" {
 		if aliases, ok := f.rootAliases(ctx); ok && isProtectedRootRenamePath(aliases, oldName, newName) {
 			return &os.PathError{Op: "rename", Path: oldName, Err: fs.ErrPermission}
@@ -99,7 +110,7 @@ func (f *FileSystem) Stat(ctx context.Context, name string) (os.FileInfo, error)
 	if err != nil {
 		return nil, mapError("stat", name, err)
 	}
-	return infoFromNode(node, name), nil
+	return f.info(node, name), nil
 }
 
 func (f *FileSystem) remotePath(ctx context.Context, name string) string {
@@ -168,6 +179,7 @@ type fileInfo struct {
 	mode    fs.FileMode
 	modTime time.Time
 	isDir   bool
+	version string
 }
 
 type rootAliasSet struct {
@@ -176,7 +188,12 @@ type rootAliasSet struct {
 	protectedRaw map[string]struct{}
 }
 
-func infoFromNode(node evs.Node, exposedPath string) os.FileInfo {
+func (f *FileSystem) info(node evs.Node, name string) fileInfo {
+	node.Version += "|" + f.client.Revision()
+	return infoFromNode(node, name)
+}
+
+func infoFromNode(node evs.Node, exposedPath string) fileInfo {
 	name := path.Base(CleanPath(exposedPath))
 	if CleanPath(exposedPath) == "/" {
 		name = "/"
@@ -184,10 +201,10 @@ func infoFromNode(node evs.Node, exposedPath string) os.FileInfo {
 	mode := fs.FileMode(0o644)
 	if node.IsDir {
 		mode = fs.ModeDir | 0o755
-		if evs.IsReadOnlyPath(node.Path) {
+		if node.ReadOnly {
 			mode = fs.ModeDir | 0o555
 		}
-	} else if evs.IsReadOnlyPath(node.Path) {
+	} else if node.ReadOnly {
 		mode = 0o444
 	}
 	return fileInfo{
@@ -196,6 +213,7 @@ func infoFromNode(node evs.Node, exposedPath string) os.FileInfo {
 		mode:    mode,
 		modTime: node.ModTime,
 		isDir:   node.IsDir,
+		version: node.Version,
 	}
 }
 
@@ -205,6 +223,12 @@ func (fi fileInfo) Mode() fs.FileMode  { return fi.mode }
 func (fi fileInfo) ModTime() time.Time { return fi.modTime }
 func (fi fileInfo) IsDir() bool        { return fi.isDir }
 func (fi fileInfo) Sys() any           { return nil }
+
+// Metadata cannot establish byte identity across external IDrive writers.
+func (fi fileInfo) ETag(context.Context) (string, error) {
+	sum := sha256.Sum256([]byte(fmt.Sprintf("%s|%d|%s|%s", fi.name, fi.size, fi.modTime.UTC().Format(time.RFC3339Nano), fi.version)))
+	return fmt.Sprintf("W/\"%x\"", sum[:]), nil
+}
 
 type dirFile struct {
 	info    os.FileInfo
@@ -310,6 +334,10 @@ func (f *readFile) ReadAt(p []byte, off int64) (int, error) {
 
 func (f *readFile) Seek(off int64, whence int) (int64, error) {
 	f.mu.Lock()
+	if f.closed {
+		f.mu.Unlock()
+		return 0, fs.ErrClosed
+	}
 	if f.file != nil {
 		file := f.file
 		f.mu.Unlock()
@@ -358,25 +386,12 @@ func (f *readFile) ensureLocal(ctx context.Context) (*os.File, error) {
 		f.mu.Unlock()
 		return file, nil
 	}
-	pendingSeek := f.pendingSeek
 	f.mu.Unlock()
 
-	localPath, err := f.cache.Ensure(ctx, f.client, f.remotePath, f.node)
+	file, err := f.cache.Open(ctx, f.client, f.remotePath, f.node)
 	if err != nil {
 		return nil, err
 	}
-
-	file, err := os.Open(localPath)
-	if err != nil {
-		return nil, err
-	}
-	if pendingSeek != 0 {
-		if _, err := file.Seek(pendingSeek, io.SeekStart); err != nil {
-			file.Close()
-			return nil, err
-		}
-	}
-
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if f.closed {
@@ -387,11 +402,16 @@ func (f *readFile) ensureLocal(ctx context.Context) (*os.File, error) {
 		_ = file.Close()
 		return f.file, nil
 	}
+	if _, err := file.Seek(f.pendingSeek, io.SeekStart); err != nil {
+		file.Close()
+		return nil, err
+	}
 	f.file = file
 	return f.file, nil
 }
 
 type writeFile struct {
+	cache         *fileCache
 	client        *evs.Client
 	remotePath    string
 	file          *os.File
@@ -416,6 +436,11 @@ func newWriteFile(ctx context.Context, client *evs.Client, remotePath string, fl
 	}
 
 	if node, err := client.Stat(ctx, remotePath); err == nil {
+		if flag&os.O_CREATE != 0 && flag&os.O_EXCL != 0 {
+			temp.Close()
+			os.Remove(temp.Name())
+			return nil, fs.ErrExist
+		}
 		if node.IsDir {
 			temp.Close()
 			os.Remove(temp.Name())
@@ -441,6 +466,11 @@ func newWriteFile(ctx context.Context, client *evs.Client, remotePath string, fl
 			wf.commitOnClose = true
 		}
 	} else if errors.Is(err, evs.ErrNotFound) {
+		if flag&os.O_CREATE == 0 {
+			temp.Close()
+			os.Remove(temp.Name())
+			return nil, err
+		}
 		wf.commitOnClose = true
 	} else {
 		temp.Close()
@@ -491,7 +521,14 @@ func (f *writeFile) Close() error {
 		os.Remove(f.tempPath)
 		return err
 	}
-	if err := f.client.UploadFile(f.ctx, f.tempPath, f.remotePath, time.Now()); err != nil {
+	var err error
+	if f.cache != nil {
+		err = f.cache.invalidate(f.remotePath)
+	}
+	if err == nil {
+		err = f.client.UploadFile(f.ctx, f.tempPath, f.remotePath, time.Now())
+	}
+	if err != nil {
 		saved, saveErr := retainUpload(f.tempPath, f.remotePath, err)
 		if saveErr == nil {
 			os.Remove(f.tempPath)
@@ -508,9 +545,9 @@ func (f *writeFile) Seek(off int64, whence int) (int64, error) {
 }
 
 func (f *writeFile) Write(p []byte) (int, error) {
-	if info, err := f.file.Stat(); err != nil {
+	if offset, err := f.file.Seek(0, io.SeekCurrent); err != nil {
 		return 0, err
-	} else if info.Size()+int64(len(p)) > evs.MaxUploadSize {
+	} else if offset > evs.MaxUploadSize || int64(len(p)) > evs.MaxUploadSize-offset {
 		stateFrom(f.ctx).fail(evs.ErrFileTooLarge)
 		return 0, evs.ErrFileTooLarge
 	}
@@ -582,6 +619,7 @@ func buildRootAliases(nodes []evs.Node) rootAliasSet {
 	deviceCandidates := make([]candidate, 0)
 
 	for _, node := range nodes {
+		reserved[node.Name] = struct{}{}
 		if node.Device == nil {
 			reserved[node.Name] = struct{}{}
 			continue
@@ -599,7 +637,7 @@ func buildRootAliases(nodes []evs.Node) rootAliasSet {
 
 	for _, item := range deviceCandidates {
 		display := item.raw
-		if item.display != item.raw && candidateCounts[item.display] == 1 {
+		if item.display != item.raw && validAlias(item.display) && candidateCounts[item.display] == 1 {
 			if _, conflict := reserved[item.display]; !conflict {
 				display = item.display
 			}
@@ -609,6 +647,10 @@ func buildRootAliases(nodes []evs.Node) rootAliasSet {
 		aliases.protectedRaw[item.raw] = struct{}{}
 	}
 	return aliases
+}
+
+func validAlias(name string) bool {
+	return name != "" && name != "." && name != ".." && !strings.ContainsAny(name, "/\\\x00")
 }
 
 func splitFirstComponent(cleanPath string) (head, tail string) {

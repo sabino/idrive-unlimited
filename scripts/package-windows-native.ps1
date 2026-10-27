@@ -89,6 +89,9 @@ if ([string]::IsNullOrWhiteSpace($BuildDate)) {
 }
 
 $normalizedVersion = Normalize-Version $Version
+if ($normalizedVersion -notmatch '^[0-9][0-9A-Za-z.+_-]*$' -or $Commit -notmatch '^[0-9A-Za-z._-]+$' -or $BuildDate -notmatch '^[0-9A-Za-z.:+_-]+$') { throw "Invalid version, commit or build date." }
+$target = @(& go env GOOS GOARCH)
+if ($LASTEXITCODE -ne 0 -or $target[0] -ne "windows" -or $target[1] -ne "amd64") { throw "Native Windows package requires a windows/amd64 Go target." }
 $artifactRoot = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($ArtifactDir)
 $artifactBase = "idrive-gateway_${normalizedVersion}_windows_amd64_native"
 $stageDir = Join-Path $artifactRoot $artifactBase
@@ -110,11 +113,17 @@ $env:CGO_ENABLED = "1"
 $binaryPath = Join-Path $stageDir "idrive-gateway.exe"
 $ldflags = "-s -w -X main.version=$normalizedVersion -X main.commit=$Commit -X main.date=$BuildDate"
 go build -ldflags $ldflags -o $binaryPath .\cmd\idrive-gateway
+if ($LASTEXITCODE -ne 0) { throw "Native Go build failed." }
 
 Copy-RuntimeDlls -toolchainBin $toolchainBin -destinationDir $stageDir
 Copy-Item .\README.md (Join-Path $stageDir "README.md") -Force
 Copy-Item .\LICENSE (Join-Path $stageDir "LICENSE") -Force
+Copy-Item .\docs (Join-Path $stageDir "docs") -Recurse -Force
+New-Item -ItemType Directory -Force -Path (Join-Path $stageDir "scripts") | Out-Null
+Copy-Item .\scripts\setup-rclone.ps1,.\scripts\configure-rclone.py (Join-Path $stageDir "scripts") -Force
 Invoke-WebRequest -Uri $BootstrapperUrl -OutFile (Join-Path $stageDir "MicrosoftEdgeWebView2Setup.exe")
+$signature = Get-AuthenticodeSignature (Join-Path $stageDir "MicrosoftEdgeWebView2Setup.exe")
+if ($signature.Status -ne "Valid" -or $signature.SignerCertificate.Subject -notmatch '(^|,\s*)O=Microsoft Corporation(,|$)') { throw "WebView2 bootstrapper must have a valid Microsoft signature." }
 
 if (Test-Path $zipPath) {
     Remove-Item $zipPath -Force
@@ -129,6 +138,7 @@ if ([string]::IsNullOrWhiteSpace($iscc)) {
     Write-Host "Skipping installer build because ISCC.exe was not found."
 } else {
     & $iscc "/Qp" "/DAppVersion=$normalizedVersion" "/DSourceDir=$stageDir" "/DOutputDir=$artifactRoot" "/DOutputBaseFilename=$installerBase" ".\packaging\windows\idrive-gateway.iss"
+    if ($LASTEXITCODE -ne 0) { throw "Inno Setup build failed." }
 }
 
 Write-Host "Built native Windows package:"

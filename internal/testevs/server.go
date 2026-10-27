@@ -15,6 +15,10 @@ import (
 )
 
 type Options struct {
+	FailRenameSource   string
+	LostRenameSource   string
+	RecreateSource     string
+	OmitDevices        bool
 	FailUpload         bool
 	FailPromotion      bool
 	LostPromotionReply bool
@@ -24,6 +28,8 @@ type Options struct {
 	FailDownload       bool
 	HTMLUpload         bool
 	CorruptCopy        bool
+	BackupRenamed      chan<- struct{}
+	HoldBackupReply    <-chan struct{}
 }
 
 type Server struct {
@@ -32,6 +38,7 @@ type Server struct {
 	Host     string
 	files    map[string][]byte
 	dirs     map[string]bool
+	devices  map[string]map[string]string
 	chunks   map[string][]byte
 	options  Options
 	requests int
@@ -40,7 +47,7 @@ type Server struct {
 
 func New(t testing.TB) *Server {
 	t.Helper()
-	s := &Server{files: map[string][]byte{}, dirs: map[string]bool{"/": true}, chunks: map[string][]byte{}}
+	s := &Server{files: map[string][]byte{}, dirs: map[string]bool{"/": true}, chunks: map[string][]byte{}, devices: map[string]map[string]string{}}
 	s.server = httptest.NewTLSServer(http.HandlerFunc(s.handle))
 	s.Host = strings.TrimPrefix(s.server.URL, "https://")
 	old := http.DefaultTransport
@@ -56,6 +63,12 @@ func (s *Server) Add(name string, data []byte) {
 	s.dirs[path.Dir(name)] = true
 }
 func (s *Server) Directory(name string) { s.mu.Lock(); defer s.mu.Unlock(); s.dirs[name] = true }
+func (s *Server) Device(name, display string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.dirs[name] = true
+	s.devices[path.Base(name)] = map[string]string{"Name": display}
+}
 func (s *Server) Read(name string) ([]byte, bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -72,7 +85,8 @@ func (s *Server) Paths() []string {
 	sort.Strings(paths)
 	return paths
 }
-func (s *Server) Requests() int { s.mu.Lock(); defer s.mu.Unlock(); return s.requests }
+func (s *Server) Requests() int          { s.mu.Lock(); defer s.mu.Unlock(); return s.requests }
+func (s *Server) CertificateDER() []byte { return s.server.Certificate().Raw }
 func (s *Server) Deletes() []string {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -89,7 +103,7 @@ func (s *Server) handle(w http.ResponseWriter, r *http.Request) {
 	}
 	if r.URL.Path == "/evs/v1/downloadFile" {
 		if s.options.FailDownload {
-			http.Error(w, "injected download failure", 503)
+			http.Error(w, "injected download failure", http.StatusServiceUnavailable)
 			return
 		}
 		data, ok := s.files[r.URL.Query().Get("p")]
@@ -113,7 +127,7 @@ func (s *Server) handle(w http.ResponseWriter, r *http.Request) {
 	}
 	if r.URL.Path == "/evs/web/upload" {
 		if s.options.FailUpload {
-			http.Error(w, "injected upload failure", 503)
+			http.Error(w, "injected upload failure", http.StatusServiceUnavailable)
 			return
 		}
 		if s.options.HTMLUpload {
@@ -165,7 +179,11 @@ func (s *Server) handle(w http.ResponseWriter, r *http.Request) {
 				contents = append(contents, map[string]any{"name": path.Base(name), "size": "0", "is_dir": true})
 			}
 		}
-		json.NewEncoder(w).Encode(map[string]any{"message": "SUCCESS", "path": p, "contents": contents})
+		payload := map[string]any{"message": "SUCCESS", "path": p, "contents": contents}
+		if !s.options.OmitDevices {
+			payload["devices"] = s.devices
+		}
+		json.NewEncoder(w).Encode(payload)
 	case "/evs/createFolder":
 		s.dirs[path.Join(r.FormValue("p"), r.FormValue("foldername"))] = true
 		reply("SUCCESS", "")
@@ -173,8 +191,8 @@ func (s *Server) handle(w http.ResponseWriter, r *http.Request) {
 		old, newName := r.FormValue("oldpath"), r.FormValue("newpath")
 		promotion := strings.Contains(path.Base(old), ".idrive-gateway-upload-")
 		backup := strings.Contains(path.Base(newName), ".idrive-gateway-backup-")
-		if (promotion && s.options.FailPromotion) || (backup && s.options.FailBackup) {
-			http.Error(w, "injected rename failure", 503)
+		if old == s.options.FailRenameSource || (promotion && s.options.FailPromotion) || (backup && s.options.FailBackup) {
+			http.Error(w, "injected rename failure", http.StatusServiceUnavailable)
 			return
 		}
 		if _, ok := s.files[newName]; ok || s.dirs[newName] {
@@ -193,12 +211,30 @@ func (s *Server) handle(w http.ResponseWriter, r *http.Request) {
 					delete(s.files, p)
 				}
 			}
+			for name := range s.dirs {
+				if strings.HasPrefix(name, old+"/") {
+					s.dirs[newName+strings.TrimPrefix(name, old)] = true
+					delete(s.dirs, name)
+				}
+			}
 		} else {
 			reply("ERROR", "NOT FOUND")
 			return
 		}
-		if (promotion && s.options.LostPromotionReply) || (backup && s.options.LostBackupReply) {
-			http.Error(w, "injected lost reply", 503)
+		if old == s.options.RecreateSource {
+			s.files[old] = []byte("external new source")
+		}
+		if backup && s.options.HoldBackupReply != nil {
+			reached, hold := s.options.BackupRenamed, s.options.HoldBackupReply
+			s.mu.Unlock()
+			if reached != nil {
+				reached <- struct{}{}
+			}
+			<-hold
+			s.mu.Lock()
+		}
+		if old == s.options.LostRenameSource || (promotion && s.options.LostPromotionReply) || (backup && s.options.LostBackupReply) {
+			http.Error(w, "injected lost reply", http.StatusServiceUnavailable)
 			return
 		}
 		reply("SUCCESS", "")

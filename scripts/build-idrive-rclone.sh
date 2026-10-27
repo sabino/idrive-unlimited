@@ -3,10 +3,11 @@
 set -euo pipefail
 repo_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 output="${1:?usage: build-idrive-rclone.sh OUTPUT}"
+python3 -c 'import sys; sys.exit("Python 3.12+ is required" if sys.version_info < (3,12) else 0)'
 output="$(python3 -c 'import pathlib,sys; print(pathlib.Path(sys.argv[1]).resolve())' "$output")"
 work_dir="$(mktemp -d "${TMPDIR:-/tmp}/idrive-rclone-build.XXXXXXXX")"
 trap 'rm -rf "$work_dir"' EXIT
-curl --fail --silent --show-error --location --proto '=https' --tlsv1.2 \
+curl --fail --silent --show-error --location --proto '=https' --tlsv1.2 --connect-timeout 15 --max-time 300 --retry 3 \
   https://github.com/rclone/rclone/archive/refs/tags/v1.75.2.tar.gz -o "$work_dir/source.tar.gz"
 python3 - "$work_dir" <<'PY'
 import hashlib, pathlib, sys, tarfile
@@ -23,6 +24,6 @@ patch --batch --fuzz=0 -p1 < "$repo_dir/patches/rclone-v1.75.2-idrive.patch"
 if [[ "${IDRIVE_RCLONE_VERIFY:-0}" == 1 ]]; then
   govulncheck .
 fi
-go build -trimpath -ldflags '-s -w -X github.com/rclone/rclone/fs.Version=v1.75.2-idrive.1' -o "$output" .
+go build -trimpath -ldflags '-s -w -X github.com/rclone/rclone/fs.Version=v1.75.2-idrive.2' -o "$output" .
 cp COPYING "$output.license"
 "$output" version

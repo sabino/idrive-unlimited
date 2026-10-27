@@ -3,6 +3,7 @@ package idrivewebdav
 import (
 	"encoding/json"
 	"fmt"
+	"idrive-unlimited/internal/atomicfile"
 	"io"
 	"io/fs"
 	"os"
@@ -18,6 +19,8 @@ const defaultCacheBytes int64 = 4 * 1024 * 1024 * 1024
 const retentionAge = 7 * 24 * time.Hour
 
 var maintenanceMu sync.Mutex
+var recoveryMu sync.Mutex
+var cachePins = make(map[string]int)
 
 func configuredBytes(name string) int64 {
 	if n, err := strconv.ParseInt(os.Getenv(name), 10, 64); err == nil && n > 0 {
@@ -37,6 +40,7 @@ func pruneFiles(root, protected string, maxBytes int64, maxAge time.Duration) er
 		mtime time.Time
 	}
 	var files []item
+	var directories []string
 	var total int64
 	err := filepath.WalkDir(root, func(p string, d fs.DirEntry, err error) error {
 		if os.IsNotExist(err) {
@@ -45,26 +49,47 @@ func pruneFiles(root, protected string, maxBytes int64, maxAge time.Duration) er
 		if err != nil {
 			return err
 		}
-		if d.IsDir() || d.Type()&os.ModeSymlink != 0 {
+		if d.IsDir() {
+			if p != root {
+				directories = append(directories, p)
+			}
+			return nil
+		}
+		if d.Type()&os.ModeSymlink != 0 {
 			return nil
 		}
 		info, err := d.Info()
+		if os.IsNotExist(err) {
+			return nil
+		}
 		if err != nil {
 			return err
 		}
 		if !info.Mode().IsRegular() {
 			return nil
 		}
+		if strings.HasPrefix(d.Name(), "upload-") && strings.HasSuffix(d.Name(), ".bin.json") {
+			if _, err := os.Stat(strings.TrimSuffix(p, ".json")); os.IsNotExist(err) {
+				_ = os.Remove(p)
+			}
+			return nil
+		}
+		size := info.Size()
+		if isRecoveryBlob(p) {
+			if meta, err := os.Stat(p + ".json"); err == nil && meta.Mode().IsRegular() {
+				size += meta.Size()
+			}
+		}
 		if strings.HasPrefix(d.Name(), "download-") && time.Since(info.ModTime()) < 24*time.Hour {
 			return nil
 		}
-		if p != protected && time.Since(info.ModTime()) > maxAge {
-			if err := os.Remove(p); err == nil {
+		if p != protected && cachePins[p] == 0 && time.Since(info.ModTime()) > maxAge {
+			if err := removeRetainedFile(p); err == nil {
 				return nil
 			}
 		}
-		files = append(files, item{p, info.Size(), info.ModTime()})
-		total += info.Size()
+		files = append(files, item{p, size, info.ModTime()})
+		total += size
 		return nil
 	})
 	if err != nil {
@@ -75,10 +100,38 @@ func pruneFiles(root, protected string, maxBytes int64, maxAge time.Duration) er
 		if total <= maxBytes {
 			break
 		}
-		if f.path != protected {
-			if err := os.Remove(f.path); err == nil {
+		if f.path != protected && cachePins[f.path] == 0 {
+			if err := removeRetainedFile(f.path); err == nil {
 				total -= f.size
 			}
+		}
+	}
+	for i := len(directories) - 1; i >= 0; i-- {
+		dir := directories[i]
+		pinned := strings.HasPrefix(protected, dir+string(filepath.Separator))
+		for target := range cachePins {
+			if strings.HasPrefix(target, dir+string(filepath.Separator)) {
+				pinned = true
+				break
+			}
+		}
+		if !pinned {
+			_ = os.Remove(dir)
+		}
+	}
+	return nil
+}
+
+func isRecoveryBlob(name string) bool {
+	return strings.HasPrefix(filepath.Base(name), "upload-") && strings.HasSuffix(name, ".bin")
+}
+func removeRetainedFile(name string) error {
+	if err := os.Remove(name); err != nil {
+		return err
+	}
+	if isRecoveryBlob(name) {
+		if err := os.Remove(name + ".json"); err != nil && !os.IsNotExist(err) {
+			return err
 		}
 	}
 	return nil
@@ -86,7 +139,7 @@ func pruneFiles(root, protected string, maxBytes int64, maxAge time.Duration) er
 
 func recoveryDir() string {
 	if explicit := os.Getenv("IDRIVE_GATEWAY_RECOVERY_DIR"); explicit != "" {
-		return explicit
+		return filepath.Join(explicit, "idrive-gateway-recovery")
 	}
 	if base, err := os.UserCacheDir(); err == nil {
 		return filepath.Join(base, "idrive-gateway", "recovery")
@@ -95,6 +148,8 @@ func recoveryDir() string {
 }
 
 func retainUpload(local, remote string, cause error) (string, error) {
+	recoveryMu.Lock()
+	defer recoveryMu.Unlock()
 	root := recoveryDir()
 	if err := os.MkdirAll(root, 0700); err != nil {
 		return local, err
@@ -104,10 +159,14 @@ func retainUpload(local, remote string, cause error) (string, error) {
 		return local, err
 	}
 	budget := configuredBytes("IDRIVE_GATEWAY_RECOVERY_MAX_BYTES")
-	if info.Size() > budget {
+	meta, err := json.MarshalIndent(map[string]any{"remote_path": remote, "saved_at": time.Now().UTC(), "error": cause.Error()}, "", "  ")
+	if err != nil {
+		return local, err
+	}
+	if info.Size() > budget-int64(len(meta)) {
 		return local, fmt.Errorf("upload exceeds recovery budget; original staging file retained")
 	}
-	if err := pruneFiles(root, "", budget-info.Size(), retentionAge); err != nil {
+	if err := pruneFiles(root, "", budget-info.Size()-int64(len(meta)), retentionAge); err != nil {
 		return local, err
 	}
 	src, err := os.Open(local)
@@ -136,8 +195,7 @@ func retainUpload(local, remote string, cause error) (string, error) {
 	if err := src.Close(); err != nil {
 		return dest.Name(), err
 	}
-	meta, _ := json.MarshalIndent(map[string]any{"remote_path": remote, "saved_at": time.Now().UTC(), "error": cause.Error()}, "", "  ")
-	if err := os.WriteFile(dest.Name()+".json", meta, 0600); err != nil {
+	if err := atomicfile.Write(dest.Name()+".json", meta); err != nil {
 		return dest.Name(), err
 	}
 	return dest.Name(), nil

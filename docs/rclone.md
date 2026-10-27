@@ -9,14 +9,13 @@ If you want the shortest working setup:
 1. Start the gateway with fixed local WebDAV credentials:
 
 ```text
-idrive-gateway serve --root / --listen 127.0.0.1:8787 --dav-user idrive --dav-pass localtest123
+idrive-gateway serve --root / --listen 127.0.0.1:8787 --dav-user idrive --dav-pass-file /private/path/password
 ```
 
-2. In another shell, create the `rclone` remote with plain `rclone`:
+2. In another shell, configure a WebDAV remote interactively with the local URL and bridge credentials:
 
 ```text
-rclone obscure localtest123
-rclone config create idrive-local webdav url http://127.0.0.1:8787 vendor other user idrive pass <obscured-password>
+rclone config
 ```
 
 3. Test it:
@@ -25,17 +24,19 @@ rclone config create idrive-local webdav url http://127.0.0.1:8787 vendor other 
 rclone lsd idrive-local:
 ```
 
-4. Mount it:
+4. Generic stock-client read-only mount examples (use the verified companion guide for writable Linux mounts):
 
 ```text
 Windows:
-rclone mount idrive-local: X: --network-mode --vfs-cache-mode full --dir-cache-time 30m --attr-timeout 1m --poll-interval 0 --no-modtime
+rclone mount --read-only idrive-local: X: --network-mode --vfs-cache-mode full --dir-cache-time 30m --attr-timeout 1m --poll-interval 0 --no-modtime
 
 Linux/macOS:
-rclone mount idrive-local: /mnt/idrive --vfs-cache-mode full --dir-cache-time 30m --attr-timeout 1m --poll-interval 0 --no-modtime
+rclone mount --read-only idrive-local: /mnt/idrive --vfs-cache-mode full --dir-cache-time 30m --attr-timeout 1m --poll-interval 0 --no-modtime
 ```
 
 The `serve` process must stay running while `rclone` uses the remote.
+
+The setup helpers require Python 3.9+ and write a dedicated private config. Pass the printed path via `--config` to subsequent commands; they leave other remotes unchanged.
 
 ## 1. Login
 
@@ -69,22 +70,19 @@ Interactive:
 rclone config
 ```
 
-Non-interactive:
+For non-interactive setup, use the private-file helper rather than putting
+credentials into process arguments:
+
+Windows helper:
 
 ```powershell
-rclone config create idrive-local webdav url http://127.0.0.1:8787 vendor other user idrive pass <obscured-password>
-```
-
-Helper script:
-
-```powershell
-powershell -ExecutionPolicy Bypass -File .\scripts\setup-rclone.ps1 -RemoteName idrive-local -Url http://127.0.0.1:8787 -User idrive -Password localtest123
+powershell -ExecutionPolicy Bypass -File .\scripts\setup-rclone.ps1 -RemoteName idrive-local -Url http://127.0.0.1:8787 -User idrive -PasswordFile C:\private\password.txt
 ```
 
 POSIX helper:
 
 ```bash
-./scripts/setup-rclone.sh --remote-name idrive-local --url http://127.0.0.1:8787 --user idrive --password localtest123
+./scripts/setup-rclone.sh --remote-name idrive-local --url http://127.0.0.1:8787 --user idrive --password-file /private/path/password
 ```
 
 ## 5. Common commands
@@ -108,10 +106,10 @@ Upload a file:
 rclone copyto .\local-file.bin idrive-local:/Uploads/local-file.bin
 ```
 
-Move a file:
+Move a file using the companion and profile from the verified mount guide:
 
 ```powershell
-rclone moveto idrive-local:/Uploads/local-file.bin idrive-local:/Uploads/local-file-renamed.bin
+idrive-rclone moveto idrive-local:/Uploads/local-file.bin idrive-local:/Uploads/local-file-renamed.bin
 ```
 
 Delete a file:
@@ -123,7 +121,7 @@ rclone delete idrive-local:/Uploads/local-file-renamed.bin
 Mount:
 
 ```powershell
-rclone mount idrive-local: X: --network-mode --vfs-cache-mode full --dir-cache-time 30m --attr-timeout 1m --poll-interval 0 --no-modtime
+rclone mount --read-only idrive-local: X: --network-mode --vfs-cache-mode full --dir-cache-time 30m --attr-timeout 1m --poll-interval 0 --no-modtime
 ```
 
 ## 6. Built-in smoke test

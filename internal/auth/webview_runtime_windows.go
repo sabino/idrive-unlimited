@@ -1,10 +1,9 @@
-//go:build windows
+//go:build windows && cgo
 
 package auth
 
 import (
 	"fmt"
-	"strings"
 
 	"golang.org/x/sys/windows/registry"
 )
@@ -34,12 +33,10 @@ func hasWebView2Runtime() bool {
 			continue
 		}
 
-		for _, valueName := range []string{"pv", "name"} {
-			value, _, err := key.GetStringValue(valueName)
-			if err == nil && strings.TrimSpace(value) != "" {
-				key.Close()
-				return true
-			}
+		value, _, err := key.GetStringValue("pv")
+		if err == nil && validWebViewVersion(value) {
+			key.Close()
+			return true
 		}
 
 		key.Close()

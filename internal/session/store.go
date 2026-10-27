@@ -1,9 +1,14 @@
 package session
 
 import (
+	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"idrive-unlimited/internal/atomicfile"
+	"idrive-unlimited/internal/processlock"
+	"io"
 	"net/http"
 
 	"net/url"
@@ -27,6 +32,7 @@ type Cookie struct {
 }
 
 type Data struct {
+	ID         string    `json:"session_id,omitempty"`
 	ServerHost string    `json:"server_host"`
 	SavedAt    time.Time `json:"saved_at"`
 	Cookies    []Cookie  `json:"cookies"`
@@ -48,9 +54,24 @@ func NewStore(path string) (*Store, error) {
 }
 
 func (s *Store) Load() (*Data, error) {
-	raw, err := os.ReadFile(s.Path)
+	info, err := os.Stat(s.Path)
 	if err != nil {
 		return nil, err
+	}
+	if !info.Mode().IsRegular() {
+		return nil, errors.New("session file must be regular")
+	}
+	f, err := os.Open(s.Path)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	raw, err := io.ReadAll(io.LimitReader(f, (4<<20)+1))
+	if err != nil {
+		return nil, err
+	}
+	if len(raw) > 4<<20 {
+		return nil, errors.New("session file exceeds 4 MiB")
 	}
 	var data Data
 	if err := json.Unmarshal(raw, &data); err != nil {
@@ -63,40 +84,53 @@ func (s *Store) Load() (*Data, error) {
 }
 
 func (s *Store) Save(data *Data) error {
+	return s.save(data, nil)
+}
+
+// SaveCurrent prevents a running server from overwriting a newer login.
+func (s *Store) SaveCurrent(data *Data) error { return s.save(data, data) }
+
+var ErrSessionChanged = errors.New("saved session changed; old server session was not persisted")
+
+func (s *Store) SaveLoaded(data, loaded *Data) error { return s.save(data, loaded) }
+
+func (s *Store) save(data *Data, expected *Data) error {
 	if data == nil {
 		return errors.New("session data is nil")
 	}
 	if data.ServerHost == "" {
 		return errors.New("session data is missing server_host")
 	}
-	data.SavedAt = time.Now().UTC()
 	if err := os.MkdirAll(filepath.Dir(s.Path), 0o700); err != nil {
 		return fmt.Errorf("create config dir: %w", err)
 	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	lock, err := processlock.Acquire(ctx, s.Path+".lock")
+	if err != nil {
+		return err
+	}
+	defer lock.Close()
+	if expected != nil {
+		old, err := s.Load()
+		if err != nil {
+			return err
+		}
+		if old.ID != expected.ID || old.ServerHost != expected.ServerHost || !old.SavedAt.Equal(expected.SavedAt) {
+			return ErrSessionChanged
+		}
+	}
+	if data.ID == "" {
+		raw, _ := json.Marshal([]any{data.ServerHost, data.Cookies})
+		sum := sha256.Sum256(raw)
+		data.ID = fmt.Sprintf("%x", sum[:])
+	}
+	data.SavedAt = time.Now().UTC()
 	payload, err := json.MarshalIndent(data, "", "  ")
 	if err != nil {
 		return fmt.Errorf("encode session file: %w", err)
 	}
-	temp, err := os.CreateTemp(filepath.Dir(s.Path), ".session-*")
-	if err != nil {
-		return fmt.Errorf("create session file: %w", err)
-	}
-	defer os.Remove(temp.Name())
-	if _, err := temp.Write(payload); err != nil {
-		temp.Close()
-		return fmt.Errorf("write session file: %w", err)
-	}
-	if err := temp.Sync(); err != nil {
-		temp.Close()
-		return fmt.Errorf("sync session file: %w", err)
-	}
-	if err := temp.Close(); err != nil {
-		return err
-	}
-	if err := os.Rename(temp.Name(), s.Path); err != nil {
-		return fmt.Errorf("replace session file: %w", err)
-	}
-	return nil
+	return atomicfile.Write(s.Path, payload)
 }
 
 func (d *Data) NewCookieJar() (http.CookieJar, error) {

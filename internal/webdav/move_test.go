@@ -20,10 +20,10 @@ func TestNegotiatedMoveReplacement(t *testing.T) {
 		fault testevs.Options
 		want  int
 	}{
-		{"success", testevs.Options{}, 204},
-		{"upload failure", testevs.Options{FailUpload: true}, 403},
-		{"promotion failure", testevs.Options{FailPromotion: true}, 403},
-		{"corrupt upload", testevs.Options{CorruptStage: true}, 403},
+		{"success without uploads", testevs.Options{FailUpload: true}, 204},
+		{"download failure", testevs.Options{FailDownload: true}, 403},
+		{"native rename failure", testevs.Options{FailRenameSource: "/source.txt"}, 403},
+		{"backup failure", testevs.Options{FailBackup: true}, 403},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			s := testevs.New(t)
@@ -64,35 +64,43 @@ func TestNegotiatedMoveReplacement(t *testing.T) {
 	}
 }
 
-func TestMoveAmbiguousRepliesPreserveBothVersions(t *testing.T) {
-	for _, fault := range []testevs.Options{{LostBackupReply: true}, {LostPromotionReply: true}} {
-		s := testevs.New(t)
-		s.Add("/source.txt", []byte("replacement"))
-		s.Add("/dest.txt", []byte("original"))
-		s.Configure(fault)
-		c, _ := evs.NewClient(s.Host, nil)
-		r := httptest.NewRequest("MOVE", "http://gateway/source.txt", nil)
-		r.Header.Set("Destination", "http://gateway/dest.txt")
-		r.Header.Set("Overwrite", "T")
-		r.Header.Set(SafeMoveHeader, SafeMoveVersion)
-		w := httptest.NewRecorder()
-		NewHandler(New(c, "/"), nil).ServeHTTP(w, r)
-		if w.Code < 400 {
-			t.Fatal("ambiguous move returned success")
-		}
-		if data, _ := s.Read("/source.txt"); string(data) != "replacement" {
-			t.Fatal("ambiguous move removed source")
-		}
-		found := false
-		for _, p := range s.Paths() {
-			data, _ := s.Read(p)
-			if string(data) == "original" {
-				found = true
+func TestMoveLostRepliesAreReconciled(t *testing.T) {
+	for _, confirmed := range []bool{false, true} {
+		t.Run(map[bool]string{false: "backup reply lost", true: "move reply lost"}[confirmed], func(t *testing.T) {
+			s := testevs.New(t)
+			s.Add("/source.txt", []byte("replacement"))
+			s.Add("/dest.txt", []byte("original"))
+			if confirmed {
+				s.Configure(testevs.Options{LostRenameSource: "/source.txt"})
+			} else {
+				s.Configure(testevs.Options{LostBackupReply: true})
 			}
-		}
-		if !found {
-			t.Fatal("ambiguous move lost original destination")
-		}
+			c, _ := evs.NewClient(s.Host, nil)
+			r := httptest.NewRequest("MOVE", "http://gateway/source.txt", nil)
+			r.Header.Set("Destination", "http://gateway/dest.txt")
+			r.Header.Set("Overwrite", "T")
+			r.Header.Set(SafeMoveHeader, SafeMoveVersion)
+			w := httptest.NewRecorder()
+			NewHandler(New(c, "/"), nil).ServeHTTP(w, r)
+			if (w.Code < 400) != confirmed {
+				t.Fatalf("status=%d", w.Code)
+			}
+			want := "original"
+			if confirmed {
+				want = "replacement"
+			}
+			if data, _ := s.Read("/dest.txt"); string(data) != want {
+				t.Fatalf("destination=%q", data)
+			}
+			if data, present := s.Read("/source.txt"); !confirmed && (!present || string(data) != "replacement") {
+				t.Fatal("failed move lost source")
+			}
+			for _, deleted := range s.Deletes() {
+				if deleted == "/source.txt" || deleted == "/dest.txt" {
+					t.Fatal("deleted a canonical path")
+				}
+			}
+		})
 	}
 }
 
@@ -109,7 +117,9 @@ func TestCompanionMountReplacement(t *testing.T) {
 			s := testevs.New(t)
 			s.Add("/source.txt", []byte("replacement"))
 			s.Add("/dest.txt", []byte("original"))
-			s.Configure(testevs.Options{FailUpload: fail})
+			if fail {
+				s.Configure(testevs.Options{FailRenameSource: "/source.txt"})
+			}
 			c, _ := evs.NewClient(s.Host, nil)
 			server := httptest.NewServer(NewHandler(New(c, "/"), nil))
 			defer server.Close()
@@ -172,7 +182,9 @@ func TestCompanionMove(t *testing.T) {
 			s := testevs.New(t)
 			s.Add("/source.txt", []byte("replacement"))
 			s.Add("/dest.txt", []byte("original"))
-			s.Configure(testevs.Options{FailUpload: fail})
+			if fail {
+				s.Configure(testevs.Options{FailRenameSource: "/source.txt"})
+			}
 			c, _ := evs.NewClient(s.Host, nil)
 			h := NewHandler(New(c, "/"), nil)
 			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -211,4 +223,29 @@ func TestCompanionMove(t *testing.T) {
 			t.Fatalf("err=%v output=%s", err, out)
 		}
 	})
+}
+
+func TestCompanionEncodingIsReversibleAndRejectsAmbiguity(t *testing.T) {
+	binary := os.Getenv("IDRIVE_RCLONE_TEST_BINARY")
+	if binary == "" {
+		t.Skip("requires companion executable")
+	}
+	for _, raw := range []string{" spaced.txt␠", "unsafe.txt "} {
+		t.Run(raw, func(t *testing.T) {
+			s := testevs.New(t)
+			s.Add("/"+raw, []byte("data"))
+			c, _ := evs.NewClient(s.Host, nil)
+			server := httptest.NewServer(NewHandler(New(c, "/"), nil))
+			defer server.Close()
+			cmd := exec.Command(binary, "lsf", ":webdav:", "--webdav-url", server.URL, "--webdav-encoding", "Slash,Dot,Ctl,Del,RightSpace,RightCrLfHtVt,InvalidUtf8", "--config", os.DevNull)
+			out, err := cmd.CombinedOutput()
+			if raw == "unsafe.txt " {
+				if err == nil || !strings.Contains(string(out), "cannot round-trip") {
+					t.Fatalf("ambiguous raw name was silently decoded: %v %s", err, out)
+				}
+			} else if err != nil || !strings.Contains(string(out), " spaced.txt \n") {
+				t.Fatalf("encoded name did not round-trip: %v %s", err, out)
+			}
+		})
+	}
 }

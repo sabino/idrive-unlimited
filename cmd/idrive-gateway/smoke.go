@@ -7,6 +7,8 @@ import (
 	"flag"
 	"fmt"
 	"idrive-unlimited/internal/evs"
+	"idrive-unlimited/internal/session"
+	"log"
 	"net"
 	"net/http"
 	"os"
@@ -39,6 +41,13 @@ func runSmoke(ctx context.Context, args []string) (runErr error) {
 	if err != nil {
 		return err
 	}
+	store, _ := session.NewStore(*storePath)
+	finish := startSessionPersistence(store, client)
+	defer func() {
+		if err := finish(); err != nil {
+			log.Printf("persist smoke session: %v", err)
+		}
+	}()
 
 	password, err := randomSecret(24)
 	if err != nil {
@@ -83,22 +92,19 @@ func runSmoke(ctx context.Context, args []string) (runErr error) {
 		return err
 	}
 
-	obscuredPass, err := runCommandCapture(ctx, "", "rclone", "obscure", password)
+	obscure := exec.CommandContext(ctx, "rclone", "obscure", "-")
+	obscure.Env = append(os.Environ(), "RCLONE_CONFIG="+os.DevNull)
+	obscure.Stdin = strings.NewReader(password + "\n")
+	obscured, err := obscure.Output()
 	if err != nil {
-		return err
+		return fmt.Errorf("obscure smoke bridge password: %w", err)
 	}
-	obscuredPass = strings.TrimSpace(obscuredPass)
-
-	if _, err := runCommandCapture(ctx, "", "rclone",
-		"--config", configPath,
-		"config", "create",
-		"idrive-smoke",
-		"webdav",
-		"url", "http://"+listener.Addr().String(),
-		"vendor", "other",
-		"user", "idrive",
-		"pass", obscuredPass,
-	); err != nil {
+	obscuredPass := strings.TrimSpace(string(obscured))
+	if obscuredPass == "" || strings.ContainsAny(obscuredPass, "\r\n") {
+		return fmt.Errorf("invalid obscured bridge password")
+	}
+	contents := fmt.Sprintf("[idrive-smoke]\ntype = webdav\nurl = http://%s/\nvendor = other\nuser = idrive\npass = %s\n", listener.Addr().String(), obscuredPass)
+	if err := os.WriteFile(configPath, []byte(contents), 0600); err != nil {
 		return err
 	}
 

@@ -7,9 +7,9 @@ func TestCleanPath(t *testing.T) {
 		"":                 "/",
 		"/":                "/",
 		"folder":           "/folder",
-		"folder\\child":    "/folder/child",
+		"folder\\child":    "/folder\\child",
 		"/folder/../child": "/child",
-		" //folder//a ":    "/folder/a",
+		" //folder//a ":    "/ /folder/a ",
 	}
 
 	for input, want := range tests {

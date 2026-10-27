@@ -2,78 +2,116 @@ package evs
 
 import (
 	"context"
+	"encoding/hex"
 	"errors"
 	"fmt"
-	"io"
 	"os"
+	"path"
 	"time"
 )
 
-// MoveReplace implements a recoverable file MOVE without deleting the target
-// to make room. On interruption, the source remains until UploadFile has staged,
-// read back and promoted the destination. A crash may leave duplicates or the
-// existing remote recovery names; it never requires deleting unverified bytes.
-// Callers must serialize gateway mutations; external writers cannot be locked
-// by the EVS API. Directory replacement is deliberately unsupported.
-func (c *Client) MoveReplace(ctx context.Context, source, dest string) error {
+// MoveReplace uses EVS's native full-path rename. It never separately deletes
+// the source, so another writer recreating that path cannot lose its new file.
+// Existing targets are preserved until the renamed bytes pass readback. Native
+// moves do not upload file content and are not subject to the web upload limit.
+func (c *Client) MoveReplace(ctx context.Context, source, dest string) (resultErr error) {
 	source, dest = CleanPath(source), CleanPath(dest)
+	if err := errors.Join(mutablePath(source), mutablePath(dest)); err != nil {
+		return err
+	}
 	if source == dest {
 		return nil
 	}
-	if IsReadOnlyPath(source) || IsReadOnlyPath(dest) || source == "/" || dest == "/" {
-		return ErrReadOnly
+	if source == "/" || dest == "/" || stringsWithin(dest, source) {
+		return os.ErrInvalid
 	}
+	if err := errors.Join(c.requireWritable(ctx, source, true), c.requireWritable(ctx, dest, true), c.protectDeviceRoot(ctx, source)); err != nil {
+		return err
+	}
+	ctx, cancel := context.WithTimeout(ctx, 30*time.Minute)
+	defer cancel()
+	c.uploadMu.Lock()
+	defer c.uploadMu.Unlock()
 	node, err := c.StatFresh(ctx, source)
 	if err != nil {
 		return err
 	}
+	target, targetErr := c.StatFresh(ctx, dest)
+	if targetErr != nil && !errors.Is(targetErr, ErrNotFound) {
+		return targetErr
+	}
 	if node.IsDir {
-		// Existing directory targets must never be recursively deleted. A
-		// non-colliding directory MOVE can use the normal EVS path.
-		if _, err := c.StatFresh(ctx, dest); err == nil {
-			return fmt.Errorf("directory replacement is unsupported")
-		} else if !errors.Is(err, ErrNotFound) {
-			return err
+		if targetErr == nil {
+			return fmt.Errorf("existing directory targets are unsupported")
 		}
 		return c.Rename(ctx, source, dest)
 	}
-	if node.Size > MaxUploadSize {
-		return ErrFileTooLarge
+	if targetErr == nil && target.IsDir {
+		return ErrIsDirectory
 	}
-	r, err := c.Download(ctx, source)
+	hash, err := c.remoteSHA256(ctx, source, node.Size)
 	if err != nil {
 		return err
 	}
-	defer r.Close()
-	f, err := os.CreateTemp("", "idrive-move-*.bin")
+	id, err := randomUploadID()
 	if err != nil {
 		return err
 	}
-	defer os.Remove(f.Name())
-	n, copyErr := io.Copy(f, io.LimitReader(r, node.Size+1))
-	closeErr := f.Close()
-	if err := errors.Join(copyErr, closeErr); err != nil {
+	tx := &uploadRecord{Version: 1, ID: id, Source: source, Dest: dest, Stage: source, Backup: joinClean(ParentDir(dest), ".idrive-gateway-backup-"+id+path.Ext(dest)), Size: node.Size, Hash: hash, Ready: true, HadOriginal: targetErr == nil}
+	if tx.HadOriginal {
+		tx.OriginalSize = target.Size
+		tx.OriginalHash, err = c.remoteSHA256(ctx, dest, target.Size)
+		if err != nil {
+			return err
+		}
+	}
+	if err = c.saveUpload(tx); err != nil {
 		return err
 	}
-	if n != node.Size {
-		return fmt.Errorf("move source size changed during download")
+	defer func() {
+		if resultErr != nil {
+			cleanup, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			defer cancel()
+			committed, recoveryErr := c.recoverUpload(cleanup, tx)
+			if committed && recoveryErr == nil {
+				resultErr = nil
+			} else {
+				resultErr = errors.Join(resultErr, recoveryErr)
+			}
+		}
+	}()
+	if tx.HadOriginal {
+		if err = c.Rename(ctx, dest, tx.Backup); err != nil {
+			return err
+		}
 	}
-	if err := c.UploadFile(ctx, f.Name(), dest, node.ModTime); err != nil {
-		return fmt.Errorf("move source retained at %s: %w", source, err)
+	// Identical source/target bytes do not prove a MOVE happened. Persist this
+	// boundary only after preserving the old target, before attempting rename.
+	tx.MoveStarted = true
+	if err = c.saveUpload(tx); err != nil {
+		return err
 	}
-	// Recheck the source immediately before removal. Avoid deleting an external
-	// edit observed after download (EVS provides no conditional-delete/CAS).
-	hash, err := fileSHA256(f.Name())
+	if err = c.Rename(ctx, source, dest); err != nil {
+		return err
+	}
+	expected, err := hex.DecodeString(tx.Hash)
 	if err != nil {
 		return err
 	}
-	if err := c.verifyUpload(ctx, source, node.Size, hash); err != nil {
-		return fmt.Errorf("move destination saved; source changed or unavailable and retained at %s: %w", source, err)
+	if err = c.verifyUpload(ctx, dest, node.Size, expected); err != nil {
+		return fmt.Errorf("renamed destination verification failed; original recovery path %s: %w", tx.Backup, err)
 	}
-	cleanup, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
-	defer cancel()
-	if err := c.Delete(cleanup, source); err != nil {
-		return fmt.Errorf("move destination saved; remove retained source %s: %w", source, err)
+	tx.Committed = true
+	if err = c.saveUpload(tx); err != nil {
+		return err
 	}
-	return nil
+	if tx.HadOriginal {
+		if err = c.removeKnown(ctx, tx.Backup, tx.OriginalSize, tx.OriginalHash); err != nil {
+			return err
+		}
+	}
+	return c.forgetUpload(tx)
+}
+func stringsWithin(name, parent string) bool {
+	return len(name) > len(parent) && name[:len(parent)] == parent && name[len(parent)] == '/'
 }

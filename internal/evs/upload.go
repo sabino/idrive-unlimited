@@ -3,6 +3,7 @@ package evs
 import (
 	"context"
 	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -20,10 +21,13 @@ var ErrFileTooLarge = errors.New("idrive: file exceeds the 2 GB web upload limit
 // bytes are uploaded and checksum-verified under a unique name first. EVS has
 // no demonstrated atomic replace, so an existing destination is renamed to a
 // recovery name until the promoted replacement has also been verified.
-func (c *Client) UploadFile(ctx context.Context, localPath, remotePath string, modTime time.Time) error {
+func (c *Client) UploadFile(ctx context.Context, localPath, remotePath string, modTime time.Time) (resultErr error) {
 	clean := CleanPath(remotePath)
-	if IsReadOnlyPath(clean) {
-		return ErrReadOnly
+	if err := mutablePath(clean); err != nil {
+		return err
+	}
+	if err := c.requireWritable(ctx, clean, true); err != nil {
+		return err
 	}
 	info, err := os.Stat(localPath)
 	if err != nil {
@@ -61,6 +65,22 @@ func (c *Client) UploadFile(ctx context.Context, localPath, remotePath string, m
 		return err
 	}
 	stage := joinClean(ParentDir(clean), ".idrive-gateway-upload-"+id+path.Ext(clean))
+	tx := &uploadRecord{Version: 1, ID: id, Dest: clean, Stage: stage, Backup: joinClean(ParentDir(clean), ".idrive-gateway-backup-"+id+path.Ext(clean)), Size: info.Size(), Hash: hex.EncodeToString(hash)}
+	if err := c.saveUpload(tx); err != nil {
+		return err
+	}
+	defer func() {
+		if c.journal != nil && resultErr != nil {
+			cleanup, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			defer cancel()
+			committed, err := c.recoverUpload(cleanup, tx)
+			if err == nil && committed {
+				resultErr = nil
+			} else {
+				resultErr = errors.Join(resultErr, err)
+			}
+		}
+	}()
 	upload := c.uploadSmall
 	if info.Size() >= chunkEnableFileSize {
 		upload = c.uploadChunked
@@ -78,7 +98,17 @@ func (c *Client) UploadFile(ctx context.Context, localPath, remotePath string, m
 		if node.IsDir {
 			return c.cleanupStage(stage, ErrIsDirectory)
 		}
-		backup = joinClean(ParentDir(clean), ".idrive-gateway-backup-"+id+path.Ext(clean))
+		backup = tx.Backup
+		tx.HadOriginal = true
+		tx.OriginalSize = node.Size
+		tx.OriginalHash, err = c.remoteSHA256(ctx, clean, node.Size)
+		if err != nil {
+			return c.cleanupStage(stage, err)
+		}
+		tx.Ready = true
+		if err := c.saveUpload(tx); err != nil {
+			return err
+		}
 		if err := c.Rename(ctx, clean, backup); err != nil {
 			// A transport error can arrive after the server performed the rename.
 			// Preserve both unique names when the outcome cannot be established.
@@ -86,6 +116,12 @@ func (c *Client) UploadFile(ctx context.Context, localPath, remotePath string, m
 		}
 	} else if !errors.Is(err, ErrNotFound) {
 		return c.cleanupStage(stage, err)
+	}
+	if !tx.Ready {
+		tx.Ready = true
+		if err := c.saveUpload(tx); err != nil {
+			return err
+		}
 	}
 	if err := c.Rename(ctx, stage, clean); err != nil {
 		return c.recoverReplacement(clean, stage, backup, info.Size(), hash, err)
@@ -95,15 +131,19 @@ func (c *Client) UploadFile(ctx context.Context, localPath, remotePath string, m
 		// both recovery names, and the original stays available at backup.
 		return fmt.Errorf("replacement verification failed: %w; original recovery path: %s", err, backup)
 	}
+	tx.Committed = true
+	if err := c.saveUpload(tx); err != nil {
+		return err
+	}
 	if backup != "" {
 		cleanup, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer cancel()
-		if err := c.Delete(cleanup, backup); err != nil {
+		if err := c.removeKnown(cleanup, backup, tx.OriginalSize, tx.OriginalHash); err != nil {
 			return fmt.Errorf("replacement saved; remove original recovery file %s: %w", backup, err)
 		}
 	}
 	c.invalidatePaths(ParentDir(clean), clean)
-	return nil
+	return c.forgetUpload(tx)
 }
 
 func fileSHA256(name string) ([]byte, error) {

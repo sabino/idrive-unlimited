@@ -74,6 +74,7 @@ if ($VerboseEnv) {
 
 $resolvedOutput = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($Output)
 go build -o $resolvedOutput .\cmd\idrive-gateway
+if ($LASTEXITCODE -ne 0) { throw "Native Go build failed." }
 Copy-RuntimeDlls -toolchainBin $toolchainBin -outputPath $resolvedOutput
 
 Write-Host "Built $resolvedOutput"

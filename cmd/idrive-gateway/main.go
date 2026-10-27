@@ -15,6 +15,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"syscall"
@@ -76,13 +77,15 @@ Usage:
   idrive-gateway login [--config PATH] [--force]
   idrive-gateway probe [--config PATH] [--root /] [--scratch /.idrive-gateway-probe] [--json]
   idrive-gateway smoke [--config PATH] [--root /] [--mount-drive X:]
-  idrive-gateway serve [--config PATH] [--root /] [--listen 127.0.0.1:8787] [--dav-user idrive] [--dav-pass PASS]
+  idrive-gateway serve [--config PATH] [--root /] [--listen 127.0.0.1:8787] [--dav-user idrive] [--dav-pass-file PATH]
   idrive-gateway version
 
 Notes:
   - login opens a lightweight native webview instead of bundling Electron.
   - Windows uses WebView2. macOS uses the system WebKit framework. Linux uses the system WebKitGTK runtime used by webview_go.
-  - serve listens on loopback only; use stock "rclone webdav" against it.
+  - serve listens on loopback only.
+  - writable mounts use idrive-rclone; see docs/verified-mount.md.
+  - supply fixed bridge credentials with a private --dav-pass-file.
 `)
 }
 
@@ -104,6 +107,13 @@ func runLogin(ctx context.Context, args []string) error {
 		if data, err := store.Load(); err == nil {
 			client, err := evs.NewClientFromSession(data)
 			if err == nil && client.Validate(ctx) == nil {
+				updated, err := client.SessionData()
+				if err != nil {
+					return err
+				}
+				if err := store.SaveLoaded(updated, data); err != nil {
+					return err
+				}
 				fmt.Printf("Session already valid.\nServer: %s\nConfig: %s\n", data.ServerHost, store.Path)
 				return nil
 			}
@@ -141,6 +151,13 @@ func runProbe(ctx context.Context, args []string) error {
 	if err != nil {
 		return err
 	}
+	store, _ := session.NewStore(*storePath)
+	finish := startSessionPersistence(store, client)
+	defer func() {
+		if err := finish(); err != nil {
+			log.Printf("persist probe session: %v", err)
+		}
+	}()
 
 	report, err := probe.Run(ctx, client, *rootPath, *scratchPath)
 	if *jsonOut {
@@ -168,6 +185,9 @@ func runServe(ctx context.Context, args []string) error {
 		return err
 	}
 
+	if strings.ContainsAny(*davUser, ":\r\n\x00") || strings.TrimSpace(*davUser) != *davUser {
+		return fmt.Errorf("WebDAV username cannot contain a colon, control characters or surrounding whitespace")
+	}
 	password, err := localPassword(*davPass, *davPassFile)
 	if err != nil {
 		return err
@@ -178,10 +198,31 @@ func runServe(ctx context.Context, args []string) error {
 		return err
 	}
 	*listenAddr = safeAddr
-	client, data, err := ensureClient(ctx, *storePath, !*noLogin)
+	sigCtx, stop := signal.NotifyContext(ctx, os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	client, data, err := ensureClient(sigCtx, *storePath, !*noLogin)
 	if err != nil {
 		return err
 	}
+	store, err := session.NewStore(*storePath)
+	if err != nil {
+		return err
+	}
+	if err := client.EnableRecovery(sigCtx, filepath.Join(filepath.Dir(store.Path), "transactions")); err != nil {
+		return err
+	}
+	var drainErr error
+	defer func() {
+		if drainErr == nil {
+			_ = client.CloseRecovery()
+		}
+	}()
+	finishSession := startSessionPersistence(store, client)
+	defer func() {
+		if err := finishSession(); err != nil {
+			log.Printf("persist session on shutdown: %v", err)
+		}
+	}()
 
 	if password == "" {
 		password, err = randomSecret(24)
@@ -192,7 +233,8 @@ func runServe(ctx context.Context, args []string) error {
 
 	fileSystem := idrivewebdav.New(client, *rootPath)
 	handler := idrivewebdav.NewHandler(fileSystem, func(req *http.Request, err error) {
-		if err != nil && !errors.Is(err, evs.ErrNotFound) {
+		quietMissing := errors.Is(err, evs.ErrNotFound) && (req.Method == "GET" || req.Method == "HEAD" || req.Method == "PROPFIND")
+		if err != nil && !quietMissing {
 			log.Printf("%s %s -> %v", req.Method, req.URL.Path, err)
 		}
 	})
@@ -201,10 +243,8 @@ func runServe(ctx context.Context, args []string) error {
 		Addr:              *listenAddr,
 		Handler:           basicAuth(*davUser, password, handler),
 		ReadHeaderTimeout: 15 * time.Second,
+		IdleTimeout:       2 * time.Minute,
 	}
-
-	sigCtx, stop := signal.NotifyContext(ctx, os.Interrupt, syscall.SIGTERM)
-	defer stop()
 
 	shutdownDone := make(chan struct{})
 	go func() {
@@ -215,6 +255,9 @@ func runServe(ctx context.Context, args []string) error {
 		if err := server.Shutdown(shutdownCtx); err != nil {
 			_ = server.Close()
 		}
+		drainCtx, drainCancel := context.WithTimeout(context.Background(), 70*time.Second)
+		defer drainCancel()
+		drainErr = handler.Drain(drainCtx)
 	}()
 
 	fmt.Printf("IDrive server: %s\n", data.ServerHost)
@@ -227,16 +270,18 @@ func runServe(ctx context.Context, args []string) error {
 		fmt.Println("Password: supplied privately")
 	}
 	fmt.Println()
-	fmt.Println("rclone example:")
-	fmt.Printf("  rclone config create idrive-local webdav url http://%s vendor other user %s pass <obscured-password>\n", *listenAddr, *davUser)
-	fmt.Printf("  rclone ls idrive-local:\n")
-	fmt.Printf("  rclone mount idrive-local: X: --vfs-cache-mode full\n")
+	fmt.Println("Configure the private remote and filename encoding using docs/verified-mount.md.")
+	fmt.Println("Verified Linux mount example:")
+	fmt.Printf("  idrive-rclone --config /private/path/idrive-rclone.conf mount idrive-local: /mnt/idrive --vfs-cache-mode full\n")
 	fmt.Println()
 	fmt.Println("Press Ctrl+C to stop.")
 
 	serveErr := server.ListenAndServe()
 	stop()
 	<-shutdownDone
+	if drainErr != nil {
+		return fmt.Errorf("request recovery drain: %w", drainErr)
+	}
 	if err := serveErr; err != nil && !errors.Is(err, http.ErrServerClosed) {
 		return err
 	}
@@ -261,7 +306,7 @@ func ensureClient(ctx context.Context, storePath string, interactive bool) (*evs
 			if err != nil {
 				return nil, nil, err
 			}
-			if err := store.Save(updated); err != nil {
+			if err := store.SaveLoaded(updated, data); err != nil {
 				return nil, nil, err
 			}
 			return client, updated, nil
