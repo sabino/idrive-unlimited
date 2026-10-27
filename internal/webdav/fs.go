@@ -227,6 +227,11 @@ func (d *dirFile) Write([]byte) (int, error)         { return 0, fs.ErrInvalid }
 func (d *dirFile) Stat() (os.FileInfo, error)        { return d.info, nil }
 func (d *dirFile) Readdir(count int) ([]os.FileInfo, error) {
 	if d.pos >= len(d.entries) {
+		// Readdir with count <= 0 returns all remaining entries and no EOF,
+		// including an empty directory. WebDAV PROPFIND relies on this.
+		if count <= 0 {
+			return []os.FileInfo{}, nil
+		}
 		return nil, io.EOF
 	}
 	if count <= 0 || d.pos+count > len(d.entries) {

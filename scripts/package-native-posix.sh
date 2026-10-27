@@ -68,6 +68,20 @@ if [[ -z "$arch_label" ]]; then
   esac
 fi
 
+# Verify the compiler target rather than trusting the archive label or a
+# runner alias. GitHub's unqualified macOS labels can change CPU family.
+build_arch="$(go env GOARCH)"
+build_os="$(go env GOOS)"
+case "$build_os" in
+  darwin) expected_os="macOS" ;;
+  linux) expected_os="linux" ;;
+  *) echo "unsupported native POSIX target: $build_os" >&2; exit 1 ;;
+esac
+if [[ "$arch_label" != "$build_arch" || "$os_label" != "$expected_os" ]]; then
+  echo "native build target is $build_os/$build_arch; artifact label is $os_label/$arch_label" >&2
+  exit 1
+fi
+
 artifact_base="idrive-gateway_${normalized_version}_${os_label}_${arch_label}_native"
 mkdir -p "$artifact_dir"
 artifact_dir="$(cd "$artifact_dir" && pwd -P)"
