@@ -158,7 +158,7 @@ Notes:
 
 Linux full builds need:
 
-- Go 1.26+
+- Go 1.26.10+
 - a C/C++ compiler such as `gcc` or `clang`
 - `pkg-config`
 - GTK 3 development headers
@@ -194,7 +194,7 @@ bash scripts/go-native.sh test -race ./...
 
 macOS full builds need:
 
-- Go 1.26+
+- Go 1.26.10+
 - Xcode Command Line Tools
 
 Generic build command:

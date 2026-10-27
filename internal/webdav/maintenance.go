@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 )
@@ -52,6 +53,9 @@ func pruneFiles(root, protected string, maxBytes int64, maxAge time.Duration) er
 			return err
 		}
 		if !info.Mode().IsRegular() {
+			return nil
+		}
+		if strings.HasPrefix(d.Name(), "download-") && time.Since(info.ModTime()) < 24*time.Hour {
 			return nil
 		}
 		if p != protected && time.Since(info.ModTime()) > maxAge {

@@ -173,3 +173,42 @@ func TestReadPropagatesRequestCancellation(t *testing.T) {
 		t.Fatalf("got %v", err)
 	}
 }
+
+type blockingDownload struct{ started, finished chan struct{} }
+
+func (d blockingDownload) DownloadToFile(ctx context.Context, _, _ string) error {
+	close(d.started)
+	<-ctx.Done()
+	close(d.finished)
+	return ctx.Err()
+}
+func TestCancellationFinishesOwnerCleanupBeforeReturning(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv(cacheDirEnv, root)
+	cache := newFileCache("cancel-in-flight")
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	dl := blockingDownload{started: make(chan struct{}), finished: make(chan struct{})}
+	result := make(chan error, 1)
+	go func() { _, err := cache.Ensure(ctx, dl, "/file", evs.Node{Size: 1}); result <- err }()
+	<-dl.started
+	cancel()
+	if err := <-result; !errors.Is(err, context.Canceled) {
+		t.Fatal(err)
+	}
+	select {
+	case <-dl.finished:
+	default:
+		t.Fatal("download still running after canceled owner returned")
+	}
+	var remaining []string
+	filepath.WalkDir(root, func(p string, d os.DirEntry, err error) error {
+		if err == nil && !d.IsDir() {
+			remaining = append(remaining, p)
+		}
+		return err
+	})
+	if len(remaining) != 0 {
+		t.Fatalf("temporary files left after cancellation: %v", remaining)
+	}
+}
