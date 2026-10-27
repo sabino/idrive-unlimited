@@ -158,7 +158,7 @@ Notes:
 
 Linux full builds need:
 
-- Go 1.26.10+
+- Go 1.27.3+
 - a C/C++ compiler such as `gcc` or `clang`
 - `pkg-config`
 - GTK 3 development headers
@@ -194,7 +194,7 @@ bash scripts/go-native.sh test -race ./...
 
 macOS full builds need:
 
-- Go 1.26.10+
+- Go 1.27.3+
 - Xcode Command Line Tools
 
 Generic build command:
@@ -251,13 +251,13 @@ idrive-gateway probe --root /
 2. Start the local WebDAV bridge with fixed credentials so your `rclone` remote stays stable:
 
 ```text
-idrive-gateway serve --root / --listen 127.0.0.1:8787 --dav-user idrive --dav-pass localtest123
+idrive-gateway serve --root / --listen 127.0.0.1:8787 --dav-user idrive --dav-pass-file /private/path/password
 ```
 
 3. In another shell, create or update the `rclone` remote with plain `rclone`:
 
 ```text
-rclone obscure localtest123
+rclone obscure - < /private/path/password
 rclone config create idrive-local webdav url http://127.0.0.1:8787 vendor other user idrive pass <obscured-password>
 ```
 
@@ -268,7 +268,9 @@ rclone lsd idrive-local:
 rclone ls idrive-local:
 ```
 
-5. Mount it:
+5. For a writable mount with replacement-rename protection, build and use the [verified companion](docs/verified-mount.md). Stock rclone remains usable for ordinary commands; its rename-overwrite path can pre-delete a destination.
+
+Stock mount examples (see the companion guide before using writable mounts):
 
 ```text
 Windows:

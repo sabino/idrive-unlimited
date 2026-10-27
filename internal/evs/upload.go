@@ -2,7 +2,7 @@ package evs
 
 import (
 	"context"
-	"crypto/md5"
+	"crypto/sha256"
 	"errors"
 	"fmt"
 	"io"
@@ -52,7 +52,7 @@ func (c *Client) UploadFile(ctx context.Context, localPath, remotePath string, m
 	} else if err != nil && !errors.Is(err, ErrNotFound) {
 		return err
 	}
-	hash, err := fileMD5(localPath)
+	hash, err := fileSHA256(localPath)
 	if err != nil {
 		return err
 	}
@@ -106,13 +106,13 @@ func (c *Client) UploadFile(ctx context.Context, localPath, remotePath string, m
 	return nil
 }
 
-func fileMD5(name string) ([]byte, error) {
+func fileSHA256(name string) ([]byte, error) {
 	f, err := os.Open(name)
 	if err != nil {
 		return nil, err
 	}
 	defer f.Close()
-	h := md5.New()
+	h := sha256.New()
 	if _, err := io.Copy(h, f); err != nil {
 		return nil, err
 	}
@@ -132,7 +132,7 @@ func (c *Client) verifyUpload(ctx context.Context, remote string, size int64, ex
 		return err
 	}
 	defer r.Close()
-	h := md5.New()
+	h := sha256.New()
 	n, err := io.Copy(h, io.LimitReader(r, size+1))
 	if err != nil {
 		return err

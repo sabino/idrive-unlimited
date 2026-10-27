@@ -94,6 +94,9 @@ func TestIsProtectedRootRenamePath(t *testing.T) {
 	if !isProtectedRootRenamePath(aliases, "/Phone Backup", "/Renamed Phone") {
 		t.Fatalf("expected root device rename to be blocked")
 	}
+	if !isProtectedRootRenamePath(aliases, "/Phone Backup", "/Cloud/Nested") || !isProtectedRootRenamePath(aliases, "/Phone Backup", "/Phone Backup/Nested") {
+		t.Fatal("protected device root can be moved into a directory")
+	}
 	if isProtectedRootRenamePath(aliases, "/Phone Backup/Photos", "/Phone Backup/Renamed Photos") {
 		t.Fatalf("expected nested rename to stay allowed")
 	}
