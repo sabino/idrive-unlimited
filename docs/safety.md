@@ -6,15 +6,15 @@ The gateway can mount IDrive read/write. Run `login` once, then reuse the saved 
 
 The web upload limit is enforced conservatively at 2,000,000,000 bytes, before remote changes. Oversized WebDAV PUT requests return HTTP 413. A failed or incomplete incoming request is discarded without committing its partial body.
 
-Each complete upload is staged at a unique remote name and downloaded for a size/checksum check. For replacements, the existing file is then renamed to a unique backup, the staged file is promoted, and the final path is checked again before the backup is removed. This adds transfer overhead to writes. Upload commits within one gateway client are serialized.
+Each complete upload is staged at a unique remote name and downloaded for a size/SHA-256 check. For replacements, the existing file is then renamed to a unique backup, the staged file is promoted, and the final path is checked again before the backup is removed. This adds transfer overhead to writes. Upload commits within one gateway client are serialized.
 
-EVS does not provide a demonstrated atomic replacement operation. During a replacement, the destination can briefly be absent. A promotion failure triggers rollback when the destination is confirmed missing. If the server's outcome cannot be established, the gateway preserves recovery files and reports their paths rather than deleting uncertain bytes. Concurrent modifications from another gateway or the IDrive website cannot be made transactional by this local process.
+EVS does not provide a demonstrated atomic replacement operation. Gateway requests are serialized around mutations so its readers do not see the backup/promotion window. External IDrive clients can briefly see the destination absent. A promotion failure triggers rollback when the destination is confirmed missing. If the server's outcome cannot be established, the gateway preserves recovery files and reports their paths rather than deleting uncertain bytes. Concurrent modifications from another gateway or the IDrive website cannot be made transactional by this local process.
 
 Complete local uploads that fail to save are retained under the user cache directory in `idrive-gateway/recovery`. The error includes the recovery filename; its adjacent JSON file records the intended remote path. These files contain private uploaded content. The default retention budget is 4 GiB and seven days, pruned when recovery storage is used. Override the location with `IDRIVE_GATEWAY_RECOVERY_DIR` and the byte budget with `IDRIVE_GATEWAY_RECOVERY_MAX_BYTES`. If retention itself fails, the error identifies the staging/recovery file that remains.
 
-EVS and WebDAV COPY/MOVE operations reject an already-existing target, avoiding both completion checks against unrelated bytes and the generic WebDAV handler's delete-before-copy/move behavior. WebDAV returns HTTP 412 when the destination still exists when COPY/MOVE arrives.
+Ordinary WebDAV COPY/MOVE operations reject an existing target with HTTP 412. Stock rclone 1.75.2 can separately DELETE the target before MOVE, bypassing that guard. For mounting, use the [verified companion](verified-mount.md): it negotiates `X-IDrive-Safe-Move: verified-copy-v1`, skips rclone's pre-delete and leaves replacement to the gateway. Explicit DELETE still deletes data.
 
-Clients can issue separate operations: stock rclone may explicitly DELETE a destination before sending MOVE, so the gateway no longer sees a collision. This client-side rename-overwrite sequence remains non-atomic and is not protected by the PUT replacement transaction. Use normal file-content writes/uploads (PUT, including `rclone copyto`) for verified replacements, or rename to a new name. An explicit DELETE still deletes the requested data.
+A negotiated file MOVE downloads the source to a private temporary file, uses the staged SHA-256-verified upload transaction for the target, then rechecks the source before removing it. Both same-directory and cross-directory replacement are supported up to the upload limit. Existing directory targets are rejected. A failed upload retains the source; uncertain upstream outcomes retain remote recovery files. A crash or failed source removal can leave duplicates, and an error after promotion can mean the destination was saved while the source remains. Inspect the reported paths before retrying. EVS has no conditional deletion or cross-client lock, so concurrent external edits and fully atomic remote POSIX rename semantics remain unsupported.
 
 ## Download cache
 
@@ -28,6 +28,8 @@ Reads are still downloaded completely before local seeking. Request cancellation
 
 The session file is replaced using a new private temporary file, preserving the previous file if replacement fails. New sessions retain cookie paths, domains, host-only scope, expiry, deletion, Secure, and HttpOnly attributes. Existing session files remain loadable. Cookie attributes that an older gateway already discarded cannot be reconstructed without a new login, but existing valid sessions can still be reused.
 
+Use `--dav-pass-file /private/path/password` with a regular 0600 file on Unix to keep the bridge password out of process arguments. Supplied passwords are not printed. Windows requires an appropriately restricted file ACL. Basic authentication comparisons use fixed-length constant-time hashes. Metadata responses are limited to 64 MiB, and errors omit raw upstream documents and unknown API message fields.
+
 The local server accepts only explicit loopback IP addresses or `localhost`. Wildcard and LAN binds are rejected before authentication starts. The native token exchange accepts HTTPS IDrive URLs, supports the API's `redirect_url` fallback, and rejects redirects to unrelated origins.
 
 On Linux, use `bash scripts/go-native.sh build -o idrive-gateway ./cmd/idrive-gateway` to support either WebKitGTK pkg-config family. Native tests use `bash scripts/go-native.sh test -race ./...`. Release packaging uses the same helper and removes its temporary compatibility alias afterward.
@@ -38,7 +40,7 @@ After starting the gateway and configuring a local rclone WebDAV remote as descr
 
 ```sh
 mkdir -p "$HOME/mnt/idrive"
-rclone mount idrive-local: "$HOME/mnt/idrive" \
+idrive-rclone mount idrive-local: "$HOME/mnt/idrive" \
   --vfs-cache-mode full --vfs-cache-max-size 4G \
   --dir-cache-time 30s --attr-timeout 1s --poll-interval 0 --no-modtime
 ```

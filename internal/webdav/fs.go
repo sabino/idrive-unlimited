@@ -74,6 +74,11 @@ func (f *FileSystem) OpenFile(ctx context.Context, name string, flag int, _ os.F
 }
 
 func (f *FileSystem) RemoveAll(ctx context.Context, name string) error {
+	if state := stateFrom(ctx); state != nil && state.moveDestination == CleanPath(name) {
+		// x/net/webdav calls this before Rename for Overwrite:T. Preserve the
+		// destination here; MoveReplace owns its verified replacement instead.
+		return nil
+	}
 	return mapError("remove", name, f.client.Delete(ctx, f.remotePath(ctx, name)))
 }
 
@@ -82,6 +87,9 @@ func (f *FileSystem) Rename(ctx context.Context, oldName, newName string) error 
 		if aliases, ok := f.rootAliases(ctx); ok && isProtectedRootRenamePath(aliases, oldName, newName) {
 			return &os.PathError{Op: "rename", Path: oldName, Err: fs.ErrPermission}
 		}
+	}
+	if state := stateFrom(ctx); state != nil && state.moveDestination == CleanPath(newName) {
+		return mapError("rename", oldName, f.client.MoveReplace(ctx, f.remotePath(ctx, oldName), f.remotePath(ctx, newName)))
 	}
 	return mapError("rename", oldName, f.client.Rename(ctx, f.remotePath(ctx, oldName), f.remotePath(ctx, newName)))
 }
@@ -620,7 +628,7 @@ func isProtectedRootRenamePath(aliases rootAliasSet, oldName, newName string) bo
 	if oldHead == "" || newHead == "" {
 		return false
 	}
-	if oldTail != "" || newTail != "" {
+	if oldTail != "" {
 		return false
 	}
 
@@ -636,5 +644,5 @@ func isProtectedRootRenamePath(aliases rootAliasSet, oldName, newName string) bo
 	if raw, exists := aliases.displayToRaw[newHead]; exists {
 		newRaw = raw
 	}
-	return oldRaw != newRaw
+	return oldRaw != newRaw || newTail != ""
 }

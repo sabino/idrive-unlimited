@@ -1,5 +1,7 @@
 # rclone usage
 
+For writable mounts, follow the [verified companion guide](verified-mount.md). It prevents stock rclone’s destination pre-delete during replacement rename. The generic stock-client examples below do not provide that protection.
+
 ## Fast path
 
 If you want the shortest working setup:

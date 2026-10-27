@@ -114,6 +114,10 @@ func NewClient(serverHost string, jar http.CookieJar) (*Client, error) {
 	if serverHost == "" {
 		return nil, fmt.Errorf("server host is required")
 	}
+	u, err := url.Parse("https://" + serverHost)
+	if err != nil || u.Host != serverHost || u.Hostname() == "" || u.User != nil || u.Path != "" || u.RawQuery != "" || u.Fragment != "" {
+		return nil, fmt.Errorf("server host must be a plain HTTPS authority")
+	}
 	if jar == nil {
 		var err error
 		jar, err = session.NewJar()
@@ -337,6 +341,11 @@ func (c *Client) Rename(ctx context.Context, oldPath, newPath string) error {
 	if IsReadOnlyPath(oldClean) || IsReadOnlyPath(newClean) {
 		return ErrReadOnly
 	}
+	if _, err := c.StatFresh(ctx, newClean); err == nil {
+		return fs.ErrExist
+	} else if !errors.Is(err, ErrNotFound) {
+		return err
+	}
 
 	oldParent := ParentDir(oldClean)
 	newParent := ParentDir(newClean)
@@ -474,9 +483,8 @@ func (c *Client) Download(ctx context.Context, remotePath string) (io.ReadCloser
 		return nil, ErrUnauthorized
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		body, _ := io.ReadAll(io.LimitReader(resp.Body, 8*1024))
 		resp.Body.Close()
-		return nil, fmt.Errorf("download %s: unexpected status %s: %s", clean, resp.Status, strings.TrimSpace(string(body)))
+		return nil, fmt.Errorf("download %s: unexpected status %s", clean, resp.Status)
 	}
 	return resp.Body, nil
 }
@@ -710,7 +718,7 @@ func (c *Client) postForm(ctx context.Context, endpoint string, values url.Value
 	}
 	defer resp.Body.Close()
 
-	raw, err := io.ReadAll(resp.Body)
+	raw, err := readAPIResponse(resp.Body)
 	if err != nil {
 		return err
 	}
@@ -718,7 +726,7 @@ func (c *Client) postForm(ctx context.Context, endpoint string, values url.Value
 		return err
 	}
 	if err := json.Unmarshal(raw, out); err != nil {
-		return fmt.Errorf("decode %s response: %w: %s", endpoint, err, strings.TrimSpace(string(raw)))
+		return fmt.Errorf("decode %s response: %w", endpoint, err)
 	}
 	return nil
 }
@@ -737,7 +745,7 @@ func (c *Client) postRawJSONBody(ctx context.Context, endpoint string, body io.R
 	}
 	defer resp.Body.Close()
 
-	raw, err := io.ReadAll(resp.Body)
+	raw, err := readAPIResponse(resp.Body)
 	if err != nil {
 		return err
 	}
@@ -745,7 +753,7 @@ func (c *Client) postRawJSONBody(ctx context.Context, endpoint string, body io.R
 		return err
 	}
 	if err := json.Unmarshal(raw, out); err != nil {
-		return fmt.Errorf("decode %s response: %w: %s", endpoint, err, strings.TrimSpace(string(raw)))
+		return fmt.Errorf("decode %s response: %w", endpoint, err)
 	}
 	reply := uploadSessionReply{}
 	if err := json.Unmarshal(raw, &reply); err == nil && reply.Message != "" && !isSuccess(reply.Message) {
@@ -768,7 +776,7 @@ func (c *Client) postFormRaw(ctx context.Context, endpoint string, values url.Va
 	}
 	defer resp.Body.Close()
 
-	raw, err := io.ReadAll(resp.Body)
+	raw, err := readAPIResponse(resp.Body)
 	if err != nil {
 		return nil, err
 	}
@@ -795,7 +803,7 @@ func (c *Client) postMultipartRaw(ctx context.Context, endpoint string, body *by
 	}
 	defer resp.Body.Close()
 
-	raw, err := io.ReadAll(resp.Body)
+	raw, err := readAPIResponse(resp.Body)
 	if err != nil {
 		return nil, err
 	}
@@ -809,14 +817,13 @@ func checkHTTPStatus(statusCode int, body []byte) error {
 	if statusCode >= 200 && statusCode < 300 {
 		return nil
 	}
-	message := strings.TrimSpace(string(body))
 	if statusCode == http.StatusUnauthorized || statusCode == http.StatusForbidden || (statusCode >= 300 && statusCode < 400) {
 		return ErrUnauthorized
 	}
 	if statusCode == http.StatusNotFound {
 		return ErrNotFound
 	}
-	return fmt.Errorf("unexpected status %d: %s", statusCode, message)
+	return fmt.Errorf("unexpected status %d", statusCode)
 }
 
 func checkMaybeJSONReply(raw []byte) error {
@@ -850,10 +857,8 @@ func apiError(status int, message, desc string) error {
 		return ErrNotFound
 	}
 
-	if desc != "" {
-		return fmt.Errorf("idrive api error: %s (%s)", message, desc)
-	}
-	return fmt.Errorf("idrive api error: %s", message)
+	// Error fields can contain a login document or reflected session data.
+	return fmt.Errorf("idrive API operation failed (HTTP %d)", status)
 }
 
 func isSuccess(message string) bool {
@@ -1061,4 +1066,17 @@ func IsReadOnlyPath(remotePath string) bool {
 	default:
 		return false
 	}
+}
+
+// Bound metadata/error responses independently of streamed file downloads.
+func readAPIResponse(r io.Reader) ([]byte, error) {
+	const limit = 64 << 20
+	data, err := io.ReadAll(io.LimitReader(r, limit+1))
+	if err != nil {
+		return nil, err
+	}
+	if len(data) > limit {
+		return nil, fmt.Errorf("IDrive API response exceeds 64 MiB")
+	}
+	return data, nil
 }

@@ -3,6 +3,8 @@ package main
 import (
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
+	"crypto/subtle"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
@@ -161,10 +163,16 @@ func runServe(ctx context.Context, args []string) error {
 	listenAddr := fs.String("listen", "127.0.0.1:8787", "loopback listen address")
 	davUser := fs.String("dav-user", "idrive", "basic auth username for the local WebDAV server")
 	davPass := fs.String("dav-pass", "", "basic auth password for the local WebDAV server")
+	davPassFile := fs.String("dav-pass-file", "", "private file containing the local WebDAV password")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
 
+	password, err := localPassword(*davPass, *davPassFile)
+	if err != nil {
+		return err
+	}
+	generatedPassword := password == ""
 	safeAddr, err := loopbackAddress(*listenAddr)
 	if err != nil {
 		return err
@@ -175,7 +183,6 @@ func runServe(ctx context.Context, args []string) error {
 		return err
 	}
 
-	password := *davPass
 	if password == "" {
 		password, err = randomSecret(24)
 		if err != nil {
@@ -199,18 +206,26 @@ func runServe(ctx context.Context, args []string) error {
 	sigCtx, stop := signal.NotifyContext(ctx, os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
+	shutdownDone := make(chan struct{})
 	go func() {
+		defer close(shutdownDone)
 		<-sigCtx.Done()
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
-		_ = server.Shutdown(shutdownCtx)
+		if err := server.Shutdown(shutdownCtx); err != nil {
+			_ = server.Close()
+		}
 	}()
 
 	fmt.Printf("IDrive server: %s\n", data.ServerHost)
 	fmt.Printf("WebDAV root: %s\n", idrivewebdav.CleanPath(*rootPath))
 	fmt.Printf("Listening on: http://%s/\n", *listenAddr)
 	fmt.Printf("Username: %s\n", *davUser)
-	fmt.Printf("Password: %s\n", password)
+	if generatedPassword {
+		fmt.Printf("Password: %s\n", password)
+	} else {
+		fmt.Println("Password: supplied privately")
+	}
 	fmt.Println()
 	fmt.Println("rclone example:")
 	fmt.Printf("  rclone config create idrive-local webdav url http://%s vendor other user %s pass <obscured-password>\n", *listenAddr, *davUser)
@@ -219,7 +234,10 @@ func runServe(ctx context.Context, args []string) error {
 	fmt.Println()
 	fmt.Println("Press Ctrl+C to stop.")
 
-	if err := server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+	serveErr := server.ListenAndServe()
+	stop()
+	<-shutdownDone
+	if err := serveErr; err != nil && !errors.Is(err, http.ErrServerClosed) {
 		return err
 	}
 	return nil
@@ -277,9 +295,12 @@ func ensureClient(ctx context.Context, storePath string, interactive bool) (*evs
 }
 
 func basicAuth(user, pass string, next http.Handler) http.Handler {
+	wantUser, wantPass := sha256.Sum256([]byte(user)), sha256.Sum256([]byte(pass))
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		gotUser, gotPass, ok := r.BasicAuth()
-		if !ok || gotUser != user || gotPass != pass {
+		userHash, passHash := sha256.Sum256([]byte(gotUser)), sha256.Sum256([]byte(gotPass))
+		valid := subtle.ConstantTimeCompare(userHash[:], wantUser[:]) & subtle.ConstantTimeCompare(passHash[:], wantPass[:])
+		if !ok || valid != 1 {
 			w.Header().Set("WWW-Authenticate", `Basic realm="idrive-gateway"`)
 			http.Error(w, "authentication required", http.StatusUnauthorized)
 			return
