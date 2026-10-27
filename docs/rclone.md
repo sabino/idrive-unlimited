@@ -12,11 +12,10 @@ If you want the shortest working setup:
 idrive-gateway serve --root / --listen 127.0.0.1:8787 --dav-user idrive --dav-pass-file /private/path/password
 ```
 
-2. In another shell, create the `rclone` remote with plain `rclone`:
+2. In another shell, configure a WebDAV remote interactively with the local URL and bridge credentials:
 
 ```text
-rclone obscure - < /private/path/password
-rclone config create idrive-local webdav url http://127.0.0.1:8787 vendor other user idrive pass <obscured-password>
+rclone config
 ```
 
 3. Test it:
@@ -71,13 +70,10 @@ Interactive:
 rclone config
 ```
 
-Non-interactive:
+For non-interactive setup, use the private-file helper rather than putting
+credentials into process arguments:
 
-```powershell
-rclone config create idrive-local webdav url http://127.0.0.1:8787 vendor other user idrive pass <obscured-password>
-```
-
-Helper script:
+Windows helper:
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\scripts\setup-rclone.ps1 -RemoteName idrive-local -Url http://127.0.0.1:8787 -User idrive -PasswordFile C:\private\password.txt
@@ -110,10 +106,10 @@ Upload a file:
 rclone copyto .\local-file.bin idrive-local:/Uploads/local-file.bin
 ```
 
-Move a file:
+Move a file using the companion and profile from the verified mount guide:
 
 ```powershell
-rclone moveto idrive-local:/Uploads/local-file.bin idrive-local:/Uploads/local-file-renamed.bin
+idrive-rclone moveto idrive-local:/Uploads/local-file.bin idrive-local:/Uploads/local-file-renamed.bin
 ```
 
 Delete a file:

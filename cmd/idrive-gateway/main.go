@@ -77,13 +77,15 @@ Usage:
   idrive-gateway login [--config PATH] [--force]
   idrive-gateway probe [--config PATH] [--root /] [--scratch /.idrive-gateway-probe] [--json]
   idrive-gateway smoke [--config PATH] [--root /] [--mount-drive X:]
-  idrive-gateway serve [--config PATH] [--root /] [--listen 127.0.0.1:8787] [--dav-user idrive] [--dav-pass PASS]
+  idrive-gateway serve [--config PATH] [--root /] [--listen 127.0.0.1:8787] [--dav-user idrive] [--dav-pass-file PATH]
   idrive-gateway version
 
 Notes:
   - login opens a lightweight native webview instead of bundling Electron.
   - Windows uses WebView2. macOS uses the system WebKit framework. Linux uses the system WebKitGTK runtime used by webview_go.
-  - serve listens on loopback only; use stock "rclone webdav" against it.
+  - serve listens on loopback only.
+  - writable mounts use idrive-rclone; see docs/verified-mount.md.
+  - supply fixed bridge credentials with a private --dav-pass-file.
 `)
 }
 
