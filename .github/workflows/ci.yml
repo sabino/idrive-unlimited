@@ -72,7 +72,7 @@ jobs:
         os:
           - ubuntu-latest
           - windows-latest
-          - macos-latest
+          - macos-15
     env:
       CGO_ENABLED: "0"
     steps:
