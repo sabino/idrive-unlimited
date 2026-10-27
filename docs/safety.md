@@ -12,7 +12,9 @@ EVS does not provide a demonstrated atomic replacement operation. During a repla
 
 Complete local uploads that fail to save are retained under the user cache directory in `idrive-gateway/recovery`. The error includes the recovery filename; its adjacent JSON file records the intended remote path. These files contain private uploaded content. The default retention budget is 4 GiB and seven days, pruned when recovery storage is used. Override the location with `IDRIVE_GATEWAY_RECOVERY_DIR` and the byte budget with `IDRIVE_GATEWAY_RECOVERY_MAX_BYTES`. If retention itself fails, the error identifies the staging/recovery file that remains.
 
-EVS and WebDAV COPY/MOVE operations reject an already-existing target, avoiding both completion checks against unrelated bytes and the generic WebDAV handler's delete-before-copy/move behavior. WebDAV returns HTTP 412 for these collisions, including rename-overwrite attempts from a mount. Replace file contents with a regular upload/PUT, or choose a new destination name; explicit deletion remains available when intended.
+EVS and WebDAV COPY/MOVE operations reject an already-existing target, avoiding both completion checks against unrelated bytes and the generic WebDAV handler's delete-before-copy/move behavior. WebDAV returns HTTP 412 when the destination still exists when COPY/MOVE arrives.
+
+Clients can issue separate operations: stock rclone may explicitly DELETE a destination before sending MOVE, so the gateway no longer sees a collision. This client-side rename-overwrite sequence remains non-atomic and is not protected by the PUT replacement transaction. Use normal file-content writes/uploads (PUT, including `rclone copyto`) for verified replacements, or rename to a new name. An explicit DELETE still deletes the requested data.
 
 ## Download cache
 
