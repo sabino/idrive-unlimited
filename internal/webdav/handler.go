@@ -90,7 +90,13 @@ func NewHandler(fs *FileSystem, logger func(*http.Request, error)) http.Handler 
 			http.Error(w, evs.ErrFileTooLarge.Error(), http.StatusRequestEntityTooLarge)
 			return
 		}
-		r = r.WithContext(context.WithValue(r.Context(), writeContextKey{}, state))
+		r = r.Clone(context.WithValue(r.Context(), writeContextKey{}, state))
+		if r.Method == "COPY" || r.Method == "MOVE" {
+			// x/net/webdav implements Overwrite:T by permanently removing
+			// the destination before attempting the operation. Keep these
+			// operations collision-safe; replacements use verified PUTs.
+			r.Header.Set("Overwrite", "F")
+		}
 		if state.put {
 			r.Body = &requestBody{ReadCloser: http.MaxBytesReader(w, r.Body, evs.MaxUploadSize), state: state}
 		}

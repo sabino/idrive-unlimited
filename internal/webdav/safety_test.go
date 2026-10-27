@@ -261,3 +261,54 @@ func TestDirectoryReaddirEndSemantics(t *testing.T) {
 		}
 	}
 }
+
+func TestWebDAVCopyMoveNeverPredeleteExistingTargets(t *testing.T) {
+	for _, method := range []string{"COPY", "MOVE"} {
+		t.Run(method, func(t *testing.T) {
+			s := testevs.New(t)
+			s.Add("/source.txt", []byte("source"))
+			s.Add("/target.txt", []byte("original target"))
+			c, _ := evs.NewClient(s.Host, nil)
+			h := NewHandler(New(c, "/"), nil)
+			r := httptest.NewRequest(method, "http://gateway/source.txt", nil)
+			r.Header.Set("Destination", "http://gateway/target.txt")
+			r.Header.Set("Overwrite", "T")
+			w := httptest.NewRecorder()
+			h.ServeHTTP(w, r)
+			if w.Code != http.StatusPreconditionFailed {
+				t.Fatalf("status=%d body=%s", w.Code, w.Body.String())
+			}
+			if data, _ := s.Read("/target.txt"); string(data) != "original target" {
+				t.Fatal("existing target changed")
+			}
+			if data, _ := s.Read("/source.txt"); string(data) != "source" {
+				t.Fatal("source changed")
+			}
+			if len(s.Deletes()) != 0 {
+				t.Fatal("permanently deleted a target before the operation")
+			}
+		})
+	}
+}
+
+func TestWebDAVCopyMoveToNewTargets(t *testing.T) {
+	for _, method := range []string{"COPY", "MOVE"} {
+		t.Run(method, func(t *testing.T) {
+			t.Setenv(cacheDirEnv, t.TempDir())
+			s := testevs.New(t)
+			s.Add("/source.txt", []byte("source"))
+			c, _ := evs.NewClient(s.Host, nil)
+			h := NewHandler(New(c, "/"), nil)
+			r := httptest.NewRequest(method, "http://gateway/source.txt", nil)
+			r.Header.Set("Destination", "http://gateway/new.txt")
+			w := httptest.NewRecorder()
+			h.ServeHTTP(w, r)
+			if w.Code != http.StatusCreated {
+				t.Fatalf("status=%d body=%s", w.Code, w.Body.String())
+			}
+			if data, _ := s.Read("/new.txt"); string(data) != "source" {
+				t.Fatal("new target missing or corrupted")
+			}
+		})
+	}
+}
