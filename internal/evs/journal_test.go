@@ -116,6 +116,67 @@ func TestRecoveryLockAndSessionNamespace(t *testing.T) {
 		t.Fatal("accepted unrelated recovery path")
 	}
 }
+
+func TestMoveRecoveryAcrossInterruptedPhases(t *testing.T) {
+	for _, phase := range []string{"prepared-identical", "backed-up", "move-started", "promoted", "committed-recreated-source"} {
+		t.Run(phase, func(t *testing.T) {
+			s := testevs.New(t)
+			c, _ := NewClient(s.Host, nil)
+			root := t.TempDir()
+			if err := c.EnableRecovery(context.Background(), root); err != nil {
+				t.Fatal(err)
+			}
+			r := recordForTest()
+			r.Source, r.Stage = "/source.txt", "/source.txt"
+			wantDest, wantSource := "old", "new"
+			switch phase {
+			case "prepared-identical":
+				r.OriginalHash = r.Hash
+				s.Add(r.Dest, []byte("new"))
+				wantDest = "new"
+			case "backed-up", "move-started":
+				s.Add(r.Backup, []byte("old"))
+				r.MoveStarted = phase == "move-started"
+			case "promoted":
+				r.MoveStarted = true
+				s.Add(r.Backup, []byte("old"))
+				s.Add(r.Dest, []byte("new"))
+				wantDest, wantSource = "new", ""
+			case "committed-recreated-source":
+				r.MoveStarted, r.Committed = true, true
+				s.Add(r.Backup, []byte("old"))
+				s.Add(r.Dest, []byte("later destination"))
+				wantDest, wantSource = "later destination", "new external source"
+			}
+			if wantSource != "" {
+				s.Add(r.Source, []byte(wantSource))
+			}
+			if err := c.saveUpload(&r); err != nil {
+				t.Fatal(err)
+			}
+			data, _ := c.SessionData()
+			c.CloseRecovery()
+			restarted, _ := NewClientFromSession(data)
+			if err := restarted.EnableRecovery(context.Background(), root); err != nil {
+				t.Fatal(err)
+			}
+			defer restarted.CloseRecovery()
+			if got, _ := s.Read(r.Dest); string(got) != wantDest {
+				t.Fatalf("destination=%q want=%q", got, wantDest)
+			}
+			if got, exists := s.Read(r.Source); string(got) != wantSource || exists != (wantSource != "") {
+				t.Fatalf("source=%q exists=%v want=%q", got, exists, wantSource)
+			}
+			if _, exists := s.Read(r.Backup); exists {
+				t.Fatal("recovery backup was not reconciled")
+			}
+			files, _ := filepath.Glob(filepath.Join(root, c.CacheIdentity(), "*.json"))
+			if len(files) != 0 {
+				t.Fatal("completed move journal remains")
+			}
+		})
+	}
+}
 func TestJournalReconcilesLostPromotionReply(t *testing.T) {
 	s := testevs.New(t)
 	s.Add("/dest.txt", []byte("old"))

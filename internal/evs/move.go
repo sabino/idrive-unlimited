@@ -85,6 +85,12 @@ func (c *Client) MoveReplace(ctx context.Context, source, dest string) (resultEr
 			return err
 		}
 	}
+	// Identical source/target bytes do not prove a MOVE happened. Persist this
+	// boundary only after preserving the old target, before attempting rename.
+	tx.MoveStarted = true
+	if err = c.saveUpload(tx); err != nil {
+		return err
+	}
 	if err = c.Rename(ctx, source, dest); err != nil {
 		return err
 	}

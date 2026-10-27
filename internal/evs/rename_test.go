@@ -57,3 +57,23 @@ func TestMoveRecoveryNeverDeletesRecreatedSource(t *testing.T) {
 		}
 	}
 }
+
+func TestMoveBackupFailureWithIdenticalBytesIsNotSuccess(t *testing.T) {
+	s := testevs.New(t)
+	s.Add("/source.txt", []byte("same"))
+	s.Add("/dest.txt", []byte("same"))
+	s.Configure(testevs.Options{FailBackup: true})
+	c, _ := NewClient(s.Host, nil)
+	if err := c.EnableRecovery(context.Background(), t.TempDir()); err != nil {
+		t.Fatal(err)
+	}
+	defer c.CloseRecovery()
+	if err := c.MoveReplace(context.Background(), "/source.txt", "/dest.txt"); err == nil {
+		t.Fatal("failed move reported success because target bytes already matched")
+	}
+	for _, name := range []string{"/source.txt", "/dest.txt"} {
+		if data, ok := s.Read(name); !ok || string(data) != "same" {
+			t.Fatalf("failed move changed %s", name)
+		}
+	}
+}

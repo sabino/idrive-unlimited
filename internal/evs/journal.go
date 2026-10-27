@@ -22,6 +22,7 @@ type uploadJournal struct {
 }
 type uploadRecord struct {
 	Source       string `json:"move_source,omitempty"`
+	MoveStarted  bool   `json:"move_started,omitempty"`
 	Version      int    `json:"version"`
 	ID           string `json:"id"`
 	Dest         string `json:"destination"`
@@ -181,7 +182,7 @@ func (c *Client) recoverUpload(ctx context.Context, r *uploadRecord) (bool, erro
 	}
 	expected, _ := hex.DecodeString(r.Hash)
 	if !r.Committed {
-		if err := c.verifyUpload(ctx, r.Dest, r.Size, expected); err == nil {
+		if err := c.verifyUpload(ctx, r.Dest, r.Size, expected); err == nil && (r.Source == "" || r.MoveStarted) {
 			r.Committed = true
 			if err = c.saveUpload(r); err != nil {
 				return false, err

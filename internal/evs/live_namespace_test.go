@@ -6,7 +6,6 @@ import (
 	"errors"
 	"idrive-unlimited/internal/session"
 	"io"
-	"net/url"
 	"os"
 	"path/filepath"
 	"testing"
@@ -66,20 +65,14 @@ func TestLiveNamespaceRename(t *testing.T) {
 		}
 	}
 	direct := func(old, new string) error {
-		v := url.Values{"oldpath": {root + "/" + old}, "newpath": {root + "/" + new}, "json": {"yes"}}
-		var reply apiReply
-		if err := c.postForm(ctx, "/evs/renameFileFolder", v, &reply); err != nil {
-			return err
-		}
-		if !isSuccess(reply.Message) {
-			return apiError(200, reply.Message, reply.Desc)
-		}
-		c.invalidatePaths(root)
-		return nil
+		return c.Rename(ctx, root+"/"+old, root+"/"+new)
 	}
 	for _, pair := range [][2]string{{"a/source.txt", "b/different.txt"}, {"a/tree", "b/different-tree"}, {"a/back\\slash.txt", "b/new\\name.txt"}} {
 		err := direct(pair[0], pair[1])
 		t.Logf("native cross-directory rename (%s): %v", pair[0], err)
+		if err != nil {
+			t.Fatal(err)
+		}
 		if err == nil {
 			if _, err = c.StatFresh(ctx, root+"/"+pair[1]); err != nil {
 				t.Fatal("successful reply without expected destination", err)
@@ -100,6 +93,9 @@ func TestLiveNamespaceRename(t *testing.T) {
 	}
 	err = direct("a/missing.txt", "b/existing.txt")
 	t.Logf("missing-source existing-target reply: %v", err)
+	if !errors.Is(err, ErrNotFound) {
+		t.Fatal("missing source did not fail with not-found", err)
+	}
 	if _, statErr := c.StatFresh(ctx, root+"/b/existing.txt"); statErr != nil {
 		t.Fatal("native failed rename removed the existing destination", statErr)
 	}
