@@ -7,6 +7,7 @@ behavior; it is not a claim that arbitrary bugs or IDrive service limits vanish.
 
 | Reproduced or inspected issue | Resulting behavior |
 | --- | --- |
+| Cross-parent renames rely on an unnecessary intermediate basename and MOVE separately deletes the source | Use the live-verified native full-path rename, preserving the target backup through checksum validation. Journal cleanup never deletes a canonical source, including a file recreated by an external writer. Native renames do not upload bytes. |
 | Process exit between backup and promotion leaves replacement state unresolved | Private, synced transaction journals are reconciled before serving. A real uploader-process kill after backup is covered by a regression test. |
 | Two servers can recover or mutate the same saved session concurrently | An OS process lock protects the session's transaction namespace and is released by process exit. |
 | Special-folder name checks block ordinary user folders named Contacts/SMS | Classify the actual device root before applying special-folder restrictions. Unknown root containers cannot be deleted without classification. |
@@ -88,7 +89,7 @@ packaging and signing prerequisites on the target platforms.
 The web upload limit remains 2,000,000,000 bytes. EVS supplies neither a verified
 atomic replace nor a conditional delete, so external concurrent writers cannot
 participate in this process's transaction lock. Full-file readback and original
-verification add bandwidth and staging costs. Remote reads still download a
+verification add bandwidth; PUT staging also consumes local storage. Native renames use no web upload, but large live renames have not been exercised. Remote reads still download a
 whole file before seeking. A fresh login whose account identity cannot be
 verified is deliberately not allowed to recover a previous login's namespace.
 

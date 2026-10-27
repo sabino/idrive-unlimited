@@ -58,7 +58,7 @@ if config.exists():
     sections = re.findall(r'^\[([^]\r\n]+)\]\s*$', content, re.M)
     if sections != [args.remote_name]:
         sys.exit('Refusing to replace a config containing other remotes or encrypted data; choose a dedicated --config path.')
-result = subprocess.run([os.environ.get('IDRIVE_RCLONE_BINARY','rclone'), 'obscure', '-'], input=(password+'\n').encode(), capture_output=True, env=dict(os.environ,RCLONE_CONFIG=os.devnull),timeout=30)
+result = subprocess.run([os.environ.get('IDRIVE_RCLONE_BINARY','rclone'), 'obscure', '-'], input=(password+'\n').encode(), capture_output=True, env=dict(os.environ,RCLONE_CONFIG=('NUL' if os.name=='nt' else os.devnull)),timeout=30)
 if result.returncode:
     sys.exit('rclone password obscuring failed.')
 obscured = result.stdout.decode().strip()

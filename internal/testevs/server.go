@@ -15,6 +15,9 @@ import (
 )
 
 type Options struct {
+	FailRenameSource   string
+	LostRenameSource   string
+	RecreateSource     string
 	OmitDevices        bool
 	FailUpload         bool
 	FailPromotion      bool
@@ -188,7 +191,7 @@ func (s *Server) handle(w http.ResponseWriter, r *http.Request) {
 		old, newName := r.FormValue("oldpath"), r.FormValue("newpath")
 		promotion := strings.Contains(path.Base(old), ".idrive-gateway-upload-")
 		backup := strings.Contains(path.Base(newName), ".idrive-gateway-backup-")
-		if (promotion && s.options.FailPromotion) || (backup && s.options.FailBackup) {
+		if old == s.options.FailRenameSource || (promotion && s.options.FailPromotion) || (backup && s.options.FailBackup) {
 			http.Error(w, "injected rename failure", http.StatusServiceUnavailable)
 			return
 		}
@@ -208,9 +211,18 @@ func (s *Server) handle(w http.ResponseWriter, r *http.Request) {
 					delete(s.files, p)
 				}
 			}
+			for name := range s.dirs {
+				if strings.HasPrefix(name, old+"/") {
+					s.dirs[newName+strings.TrimPrefix(name, old)] = true
+					delete(s.dirs, name)
+				}
+			}
 		} else {
 			reply("ERROR", "NOT FOUND")
 			return
+		}
+		if old == s.options.RecreateSource {
+			s.files[old] = []byte("external new source")
 		}
 		if backup && s.options.HoldBackupReply != nil {
 			reached, hold := s.options.BackupRenamed, s.options.HoldBackupReply
@@ -221,7 +233,7 @@ func (s *Server) handle(w http.ResponseWriter, r *http.Request) {
 			<-hold
 			s.mu.Lock()
 		}
-		if (promotion && s.options.LostPromotionReply) || (backup && s.options.LostBackupReply) {
+		if old == s.options.LostRenameSource || (promotion && s.options.LostPromotionReply) || (backup && s.options.LostBackupReply) {
 			http.Error(w, "injected lost reply", http.StatusServiceUnavailable)
 			return
 		}

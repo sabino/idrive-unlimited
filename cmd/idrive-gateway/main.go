@@ -105,6 +105,13 @@ func runLogin(ctx context.Context, args []string) error {
 		if data, err := store.Load(); err == nil {
 			client, err := evs.NewClientFromSession(data)
 			if err == nil && client.Validate(ctx) == nil {
+				updated, err := client.SessionData()
+				if err != nil {
+					return err
+				}
+				if err := store.SaveLoaded(updated, data); err != nil {
+					return err
+				}
 				fmt.Printf("Session already valid.\nServer: %s\nConfig: %s\n", data.ServerHost, store.Path)
 				return nil
 			}
@@ -142,6 +149,13 @@ func runProbe(ctx context.Context, args []string) error {
 	if err != nil {
 		return err
 	}
+	store, _ := session.NewStore(*storePath)
+	finish := startSessionPersistence(store, client)
+	defer func() {
+		if err := finish(); err != nil {
+			log.Printf("persist probe session: %v", err)
+		}
+	}()
 
 	report, err := probe.Run(ctx, client, *rootPath, *scratchPath)
 	if *jsonOut {
@@ -290,7 +304,7 @@ func ensureClient(ctx context.Context, storePath string, interactive bool) (*evs
 			if err != nil {
 				return nil, nil, err
 			}
-			if err := store.Save(updated); err != nil {
+			if err := store.SaveLoaded(updated, data); err != nil {
 				return nil, nil, err
 			}
 			return client, updated, nil

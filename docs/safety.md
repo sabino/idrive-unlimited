@@ -16,7 +16,10 @@ Complete local uploads that fail to save are retained under the user cache direc
 
 Ordinary WebDAV COPY/MOVE operations reject an existing target with HTTP 412. Stock rclone 1.75.2 can separately DELETE the target before MOVE, bypassing that guard. For mounting, use the [verified companion](verified-mount.md): it negotiates `X-IDrive-Safe-Move: verified-copy-v1`, skips rclone's pre-delete and leaves replacement to the gateway. Explicit DELETE still deletes data.
 
-A negotiated file MOVE downloads the source to a private temporary file, uses the staged SHA-256-verified upload transaction for the target, then rechecks the source before removing it. Both same-directory and cross-directory replacement are supported up to the upload limit. Existing directory targets are rejected. A failed upload retains the source; uncertain upstream outcomes retain remote recovery files. A crash or failed source removal can leave duplicates, and an error after promotion can mean the destination was saved while the source remains. Inspect the reported paths before retrying. EVS has no conditional deletion or cross-client lock, so concurrent external edits and fully atomic remote POSIX rename semantics remain unsupported.
+A negotiated file MOVE preserves an existing target under a unique backup name, uses EVS's native full-path rename, verifies the resulting bytes with SHA-256, and then removes the verified backup. It never separately DELETEs the source path, so an external writer recreating that path cannot have its new file deleted by cleanup. Native renames do not upload content and do not use the 2 GB web-upload limit. Directory moves also use the single native rename operation, avoiding intermediate-basename collisions; existing directory targets remain unsupported.
+
+An uncertain outcome retains the journal and backup. Restart reconciles completed renames or restores the old target when the source is still verified. A canonical source or destination is never deleted by move-journal cleanup. EVS still has no conditional mutation or cross-client lock, so external writers and fully atomic remote POSIX behavior remain outside this process's guarantees. Large remote renames require checksum readback and remain subject to transfer timeouts; multi-gigabyte live renames have not been exercised.
+
 
 ## Download cache
 

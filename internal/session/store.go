@@ -84,15 +84,17 @@ func (s *Store) Load() (*Data, error) {
 }
 
 func (s *Store) Save(data *Data) error {
-	return s.save(data, false)
+	return s.save(data, nil)
 }
 
 // SaveCurrent prevents a running server from overwriting a newer login.
-func (s *Store) SaveCurrent(data *Data) error { return s.save(data, true) }
+func (s *Store) SaveCurrent(data *Data) error { return s.save(data, data) }
 
 var ErrSessionChanged = errors.New("saved session changed; old server session was not persisted")
 
-func (s *Store) save(data *Data, current bool) error {
+func (s *Store) SaveLoaded(data, loaded *Data) error { return s.save(data, loaded) }
+
+func (s *Store) save(data *Data, expected *Data) error {
 	if data == nil {
 		return errors.New("session data is nil")
 	}
@@ -109,12 +111,12 @@ func (s *Store) save(data *Data, current bool) error {
 		return err
 	}
 	defer lock.Close()
-	if current {
+	if expected != nil {
 		old, err := s.Load()
 		if err != nil {
 			return err
 		}
-		if old.ID != data.ID || old.ServerHost != data.ServerHost || !old.SavedAt.Equal(data.SavedAt) {
+		if old.ID != expected.ID || old.ServerHost != expected.ServerHost || !old.SavedAt.Equal(expected.SavedAt) {
 			return ErrSessionChanged
 		}
 	}

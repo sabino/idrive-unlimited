@@ -377,6 +377,7 @@ func (c *Client) Mkdir(ctx context.Context, remotePath string) error {
 	values.Set("p", ParentDir(clean))
 	values.Set("json", "yes")
 
+	defer c.invalidatePaths(ParentDir(clean), clean)
 	var resp apiReply
 	if err := c.postForm(ctx, "/evs/createFolder", values, &resp); err != nil {
 		return err
@@ -414,31 +415,16 @@ func (c *Client) Rename(ctx context.Context, oldPath, newPath string) error {
 
 	oldParent := ParentDir(oldClean)
 	newParent := ParentDir(newClean)
-	if oldParent == newParent {
-		values := url.Values{}
-		values.Set("oldpath", oldClean)
-		values.Set("newpath", newClean)
-		values.Set("json", "yes")
-
-		var resp apiReply
-		if err := c.postForm(ctx, "/evs/renameFileFolder", values, &resp); err != nil {
-			return err
-		}
-		if !isSuccess(resp.Message) {
-			return apiError(http.StatusOK, resp.Message, resp.Desc)
-		}
-		c.invalidatePaths(oldParent, newParent, oldClean, newClean)
-		return nil
-	}
-
-	if err := c.Move(ctx, oldClean, newParent); err != nil {
+	values := url.Values{"oldpath": {oldClean}, "newpath": {newClean}, "json": {"yes"}}
+	defer c.invalidatePaths(oldParent, newParent, oldClean, newClean)
+	var resp apiReply
+	if err := c.postForm(ctx, "/evs/renameFileFolder", values, &resp); err != nil {
 		return err
 	}
-	movedPath := joinClean(newParent, path.Base(oldClean))
-	if movedPath == newClean {
-		return nil
+	if !isSuccess(resp.Message) {
+		return apiError(http.StatusOK, resp.Message, resp.Desc)
 	}
-	return c.Rename(ctx, movedPath, newClean)
+	return nil
 }
 
 func (c *Client) Copy(ctx context.Context, sourcePath, destinationDir string) error {
@@ -469,6 +455,7 @@ func (c *Client) Copy(ctx context.Context, sourcePath, destinationDir string) er
 	values.Set("sync_acc", "no")
 	values.Set("json", "yes")
 
+	defer c.invalidatePaths(ParentDir(sourceClean), destClean, sourceClean, targetPath)
 	if _, err := c.postFormRaw(ctx, "/evs/copyPasteFileFolder", values); err != nil {
 		return err
 	}
@@ -508,6 +495,7 @@ func (c *Client) Move(ctx context.Context, sourcePath, destinationDir string) er
 	values.Set("sync_acc", "no")
 	values.Set("json", "yes")
 
+	defer c.invalidatePaths(ParentDir(sourceClean), destClean, sourceClean, targetPath)
 	if _, err := c.postFormRaw(ctx, "/evs/move", values); err != nil {
 		return err
 	}
@@ -542,6 +530,7 @@ func (c *Client) Delete(ctx context.Context, remotePath string) error {
 	values.Set("trash", "no")
 	values.Set("json", "yes")
 
+	defer c.invalidatePaths(ParentDir(clean), clean)
 	_, err := c.postFormRaw(ctx, "/evs/v1/deleteFile", values)
 	if err != nil {
 		return err

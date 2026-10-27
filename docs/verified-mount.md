@@ -48,14 +48,11 @@ rename restores the VFS file's previous directory and name.
 
 ## Behavior and limits
 
-File replacement uses private local staging and the gateway's verified upload
-transaction. The source remains until the target is saved and verified. Reads
-and other mutations through this gateway wait for replacement to finish. The
-extra upload and readbacks cost bandwidth and time; replacements are limited to
-2,000,000,000 bytes and require local staging space. Existing directory targets
-are rejected. Plain COPY/MOVE requests still reject collisions.
+PUT replacement uses private local staging and verified upload. File MOVE instead preserves the target backup, uses a native full-path rename, verifies the destination, and cleans up only the backup. It never separately deletes the canonical source path. Both files and directories can move between parents without colliding with an unrelated entry sharing the old basename. Reads and other gateway mutations wait for replacement to finish.
 
-EVS does not supply an atomic replacement or conditional delete. Persistent transaction recovery reconciles interrupted replacements on restart. A failed final source removal can still leave duplicates; ambiguous promotion results
+The web upload limit remains 2,000,000,000 bytes. Native remote renames do not upload file data and therefore do not use that limit, although large-file checksums consume bandwidth and are bounded by transfer timeouts. Existing directory targets are rejected. Plain COPY/MOVE requests still reject collisions.
+
+EVS does not supply an atomic replacement or conditional delete. Persistent transaction recovery reconciles interrupted replacements on restart. An uncertain native rename can retain recovery files; ambiguous promotion results
 can leave the original target at a `.idrive-gateway-backup-*` recovery path.
 Inspect the error and recovery paths before retrying. Concurrent modifications
 from the website or another gateway are outside this process's lock. See

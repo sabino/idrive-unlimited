@@ -27,7 +27,7 @@ type writeState struct {
 
 // SafeMoveHeader is negotiated by the companion rclone build before it skips
 // its otherwise destructive destination DELETE. The protocol is recoverable,
-// not an upstream atomic rename: the source is removed only after readback.
+// not a claim about upstream atomicity: the target backup survives until readback.
 const SafeMoveHeader = "X-IDrive-Safe-Move"
 const SafeMoveVersion = "verified-copy-v1"
 

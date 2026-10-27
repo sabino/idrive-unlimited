@@ -21,6 +21,7 @@ type uploadJournal struct {
 	lock *processlock.Lock
 }
 type uploadRecord struct {
+	Source       string `json:"move_source,omitempty"`
 	Version      int    `json:"version"`
 	ID           string `json:"id"`
 	Dest         string `json:"destination"`
@@ -132,11 +133,14 @@ func validateUploadRecord(r uploadRecord, name string) error {
 	if err != nil || len(raw) != 16 || len(r.ID) != 36 || name != r.ID+".json" || r.Version != 1 {
 		return errors.New("unknown record identity or version")
 	}
-	if r.Dest != CleanPath(r.Dest) || r.Dest == "/" || r.Stage != joinClean(ParentDir(r.Dest), ".idrive-gateway-upload-"+r.ID+path.Ext(r.Dest)) || r.Backup != joinClean(ParentDir(r.Dest), ".idrive-gateway-backup-"+r.ID+path.Ext(r.Dest)) {
+	if r.Dest != CleanPath(r.Dest) || r.Dest == "/" || (r.Source == "" && r.Stage != joinClean(ParentDir(r.Dest), ".idrive-gateway-upload-"+r.ID+path.Ext(r.Dest))) || r.Backup != joinClean(ParentDir(r.Dest), ".idrive-gateway-backup-"+r.ID+path.Ext(r.Dest)) {
 		return errors.New("invalid transaction paths")
 	}
+	if r.Source != "" && (r.Source != CleanPath(r.Source) || r.Source == "/" || r.Source == r.Dest || r.Source == r.Backup || r.Stage != r.Source || !r.Ready || mutablePath(r.Source) != nil) {
+		return errors.New("invalid move source")
+	}
 	hash, err := hex.DecodeString(r.Hash)
-	if err != nil || len(hash) != sha256.Size || r.Size < 0 || r.Size > MaxUploadSize {
+	if err != nil || len(hash) != sha256.Size || r.Size < 0 || (r.Source == "" && r.Size > MaxUploadSize) {
 		return errors.New("invalid payload fingerprint")
 	}
 	if r.Ready && r.HadOriginal {
@@ -183,6 +187,11 @@ func (c *Client) recoverUpload(ctx context.Context, r *uploadRecord) (bool, erro
 				return false, err
 			}
 		} else {
+			if r.Source != "" {
+				if err := c.verifyUpload(ctx, r.Source, r.Size, expected); err != nil {
+					return false, fmt.Errorf("move outcome is uncertain; source and destination were not verified; backup retained at %s: %w", r.Backup, err)
+				}
+			}
 			_, destErr := c.StatFresh(ctx, r.Dest)
 			if destErr != nil && !errors.Is(destErr, ErrNotFound) {
 				return false, destErr
@@ -203,8 +212,10 @@ func (c *Client) recoverUpload(ctx context.Context, r *uploadRecord) (bool, erro
 			} else if destErr == nil {
 				return false, errors.New("unexpected destination bytes; recovery files retained")
 			}
-			if err = c.removeKnown(ctx, r.Stage, r.Size, r.Hash); err != nil {
-				return false, err
+			if r.Source == "" {
+				if err = c.removeKnown(ctx, r.Stage, r.Size, r.Hash); err != nil {
+					return false, err
+				}
 			}
 			if r.HadOriginal {
 				if err = c.removeKnown(ctx, r.Backup, r.OriginalSize, r.OriginalHash); err != nil {
@@ -224,8 +235,10 @@ func (c *Client) recoverUpload(ctx context.Context, r *uploadRecord) (bool, erro
 			return true, err
 		}
 	}
-	if err := c.removeKnown(ctx, r.Stage, r.Size, r.Hash); err != nil {
-		return true, err
+	if r.Source == "" {
+		if err := c.removeKnown(ctx, r.Stage, r.Size, r.Hash); err != nil {
+			return true, err
+		}
 	}
 	return true, c.forgetUpload(r)
 }

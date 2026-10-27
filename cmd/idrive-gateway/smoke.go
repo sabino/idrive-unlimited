@@ -7,6 +7,8 @@ import (
 	"flag"
 	"fmt"
 	"idrive-unlimited/internal/evs"
+	"idrive-unlimited/internal/session"
+	"log"
 	"net"
 	"net/http"
 	"os"
@@ -39,6 +41,13 @@ func runSmoke(ctx context.Context, args []string) (runErr error) {
 	if err != nil {
 		return err
 	}
+	store, _ := session.NewStore(*storePath)
+	finish := startSessionPersistence(store, client)
+	defer func() {
+		if err := finish(); err != nil {
+			log.Printf("persist smoke session: %v", err)
+		}
+	}()
 
 	password, err := randomSecret(24)
 	if err != nil {
