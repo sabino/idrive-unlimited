@@ -148,9 +148,9 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - runner: macos-15
+          - runner: macos-15-intel
             arch_label: amd64
-          - runner: macos-14
+          - runner: macos-15
             arch_label: arm64
     steps:
       - name: Checkout
