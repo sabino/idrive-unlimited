@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"os"
 	"path"
@@ -32,13 +33,13 @@ type fileCache struct {
 func newFileCache(namespace string) *fileCache {
 	return &fileCache{
 		rootDir:   defaultCacheDir(),
-		namespace: cacheNamespace(namespace),
+		namespace: cacheNamespace("v2|" + namespace),
 	}
 }
 
 func defaultCacheDir() string {
-	if explicit := strings.TrimSpace(os.Getenv(cacheDirEnv)); explicit != "" {
-		return explicit
+	if explicit := os.Getenv(cacheDirEnv); explicit != "" {
+		return filepath.Join(explicit, "idrive-gateway-files")
 	}
 	if base, err := os.UserCacheDir(); err == nil && strings.TrimSpace(base) != "" {
 		return filepath.Join(base, "idrive-gateway", "files")
@@ -47,7 +48,7 @@ func defaultCacheDir() string {
 }
 
 func cacheNamespace(raw string) string {
-	trimmed := strings.TrimSpace(raw)
+	trimmed := raw
 	if trimmed == "" {
 		return "default"
 	}
@@ -60,6 +61,12 @@ func (c *fileCache) Ensure(ctx context.Context, dl downloader, remotePath string
 		return "", err
 	}
 	target := c.targetPath(remotePath, node)
+	release := pinCache(target)
+	defer release()
+	return c.ensure(ctx, dl, remotePath, node, target)
+}
+
+func (c *fileCache) ensure(ctx context.Context, dl downloader, remotePath string, node evs.Node, target string) (string, error) {
 	if err := pruneFiles(c.rootDir, target, configuredBytes("IDRIVE_GATEWAY_CACHE_MAX_BYTES"), retentionAge); err != nil {
 		return "", err
 	}
@@ -81,6 +88,9 @@ func (c *fileCache) Ensure(ctx context.Context, dl downloader, remotePath string
 		case <-ctx.Done():
 			return "", ctx.Err()
 		case <-flight.done:
+			if ctx.Err() == nil && (errors.Is(flight.err, context.Canceled) || errors.Is(flight.err, context.DeadlineExceeded)) {
+				return c.fill(ctx, dl, remotePath, node, target)
+			}
 			return flight.path, flight.err
 		}
 	}
@@ -97,6 +107,50 @@ func (c *fileCache) Ensure(ctx context.Context, dl downloader, remotePath string
 	close(flight.done)
 	c.mu.Unlock()
 	return local, err
+}
+
+// Open pins a cache path until its file descriptor is acquired. Eviction must
+// not remove a freshly published download between Ensure and os.Open.
+func (c *fileCache) Open(ctx context.Context, dl downloader, remote string, node evs.Node) (*os.File, error) {
+	target := c.targetPath(remote, node)
+	release := pinCache(target)
+	defer release()
+	local, err := c.ensure(ctx, dl, remote, node, target)
+	if err != nil {
+		return nil, err
+	}
+	return os.Open(local)
+}
+
+func pinCache(target string) func() {
+	maintenanceMu.Lock()
+	cachePins[target]++
+	maintenanceMu.Unlock()
+	return func() {
+		maintenanceMu.Lock()
+		cachePins[target]--
+		if cachePins[target] == 0 {
+			delete(cachePins, target)
+		}
+		maintenanceMu.Unlock()
+	}
+}
+
+func (c *fileCache) invalidate(remote string) error {
+	maintenanceMu.Lock()
+	defer maintenanceMu.Unlock()
+	return os.RemoveAll(c.pathDir(remote))
+}
+
+func (c *fileCache) invalidateAll() error {
+	maintenanceMu.Lock()
+	defer maintenanceMu.Unlock()
+	return os.RemoveAll(filepath.Join(c.rootDir, c.namespace))
+}
+
+func (c *fileCache) pathDir(remote string) string {
+	hash := sha256.Sum256([]byte(CleanPath(remote)))
+	return filepath.Join(c.rootDir, c.namespace, hex.EncodeToString(hash[:]))
 }
 
 type cacheFlight struct {
@@ -157,10 +211,12 @@ func (c *fileCache) targetPath(remotePath string, node evs.Node) string {
 		strconv.FormatInt(node.Size, 10),
 		strconv.FormatInt(node.ModTime.UTC().Unix(), 10),
 		node.Version,
+		// Bound reuse even when an external writer preserves all metadata.
+		strconv.FormatInt(time.Now().Unix()/300, 10),
 	}, "|")
 	sum := sha256.Sum256([]byte(key))
 	hash := hex.EncodeToString(sum[:])
-	return filepath.Join(c.rootDir, c.namespace, hash[:2], hash+safeExt(remotePath))
+	return filepath.Join(c.pathDir(remotePath), hash+safeExt(remotePath))
 }
 
 func safeExt(remotePath string) string {
@@ -168,19 +224,24 @@ func safeExt(remotePath string) string {
 	if ext == "" || len(ext) > 16 || strings.ContainsAny(ext, `/\`) {
 		return ""
 	}
+	for _, r := range ext {
+		if !(r == '.' || r == '-' || r == '_' || r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' || r >= '0' && r <= '9') {
+			return ""
+		}
+	}
 	return ext
 }
 
 func cacheFileValid(localPath string, expectedSize int64) (bool, error) {
-	info, err := os.Stat(localPath)
+	info, err := os.Lstat(localPath)
 	if err != nil {
 		if os.IsNotExist(err) {
 			return false, nil
 		}
 		return false, err
 	}
-	if info.IsDir() {
-		return false, fmt.Errorf("cache path is a directory: %s", localPath)
+	if !info.Mode().IsRegular() {
+		return false, fmt.Errorf("cache path is not a regular file: %s", localPath)
 	}
 	return info.Size() == expectedSize, nil
 }

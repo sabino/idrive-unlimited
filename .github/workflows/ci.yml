@@ -43,10 +43,18 @@ jobs:
             exit 1
           fi
 
+      - name: Check native login bootstrap
+        run: node scripts/test-auth-bootstrap.mjs
+
       - name: Vet
         env:
           CGO_ENABLED: "0"
         run: go vet ./...
+
+      - name: Static analysis
+        env:
+          CGO_ENABLED: "0"
+        run: go run honnef.co/go/tools/cmd/staticcheck@v0.8.2 ./...
 
   dependency-security:
     name: Dependency security
@@ -81,6 +89,10 @@ jobs:
         env:
           IDRIVE_RCLONE_TEST_BINARY: ${{ runner.temp }}/idrive-rclone
         run: go test -race ./internal/webdav -run 'TestCompanionMove|TestNegotiatedMove' -count=1
+      - name: Verify private remote configuration
+        env:
+          IDRIVE_RCLONE_BINARY: ${{ runner.temp }}/idrive-rclone
+        run: python3 scripts/test_configure_rclone.py
 
   unit-tests:
     name: Unit Tests (${{ matrix.os }})
@@ -128,8 +140,7 @@ jobs:
       - name: Install native build dependencies
         shell: bash
         run: |
-          sudo apt-get update
-          sudo apt-get install -y build-essential pkg-config libgtk-3-dev libwebkit2gtk-4.1-dev
+          bash scripts/install-linux-build-deps.sh
 
       - name: Native tests with race detection
         shell: bash
@@ -236,7 +247,10 @@ jobs:
 
       - name: Install Inno Setup
         shell: powershell
-        run: choco install innosetup --no-progress -y
+        run: choco install innosetup rclone --no-progress -y
+
+      - name: Verify private remote configuration on Windows
+        run: python scripts/test_configure_rclone.py
 
       - name: Build native package
         shell: powershell

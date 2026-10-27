@@ -2,33 +2,27 @@ param(
     [string]$RemoteName = "idrive-local",
     [string]$Url = "http://127.0.0.1:8787",
     [string]$User = "idrive",
-    [Parameter(Mandatory = $true)]
-    [string]$Password
+    [string]$PasswordFile,
+    [string]$Password,
+    [string]$Config
 )
-
 $ErrorActionPreference = "Stop"
-
-if (-not (Get-Command rclone -ErrorAction SilentlyContinue)) {
-    throw "rclone was not found on PATH."
+$rcloneBinary = if ($env:IDRIVE_RCLONE_BINARY) { $env:IDRIVE_RCLONE_BINARY } else { "rclone" }
+if (-not (Get-Command $rcloneBinary -ErrorAction SilentlyContinue)) { throw "rclone was not found on PATH." }
+$python = Get-Command python3 -ErrorAction SilentlyContinue
+if (-not $python) { $python = Get-Command python -ErrorAction SilentlyContinue }
+if (-not $python) { throw "Python 3.9+ is required for private configuration input." }
+$arguments = @((Join-Path $PSScriptRoot 'configure-rclone.py'), '--remote-name', $RemoteName, '--url', $Url, '--user', $User)
+if ($Config) { $arguments += @('--config', $Config) }
+if ($PasswordFile) {
+    if ($Password) { throw "Use only one password option." }
+    & $python.Source @arguments --password-file $PasswordFile
+} else {
+    if (-not $Password) { throw "Supply -PasswordFile with the private bridge password file." }
+    $previousEncoding = $OutputEncoding
+    try {
+        $OutputEncoding = New-Object Text.UTF8Encoding($false)
+        $Password | & $python.Source @arguments
+    } finally { $OutputEncoding = $previousEncoding }
 }
-
-$obscured = (& rclone obscure $Password).Trim()
-if ([string]::IsNullOrWhiteSpace($obscured)) {
-    throw "rclone obscure returned an empty password."
-}
-
-$args = @(
-    "config", "create", $RemoteName, "webdav",
-    "url", $Url,
-    "vendor", "other",
-    "user", $User,
-    "pass", $obscured
-)
-
-& rclone @args
-
-Write-Host ""
-Write-Host "Configured rclone remote '$RemoteName' for $Url"
-Write-Host "Next commands:"
-Write-Host "  rclone lsd ${RemoteName}:"
-Write-Host "  rclone mount ${RemoteName}: X: --network-mode --vfs-cache-mode full --dir-cache-time 30m --attr-timeout 1m --poll-interval 0 --no-modtime"
+if ($LASTEXITCODE -ne 0) { throw "rclone configuration failed." }

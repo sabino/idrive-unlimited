@@ -9,6 +9,7 @@ os_label=""
 arch_label=""
 
 while [[ $# -gt 0 ]]; do
+  if [[ $# -lt 2 ]]; then echo "missing value for $1" >&2; exit 1; fi
   case "$1" in
     --version)
       version="$2"
@@ -46,6 +47,9 @@ if [[ -z "$build_date" ]]; then
 fi
 
 normalized_version="${version#v}"
+if [[ ! "$normalized_version" =~ ^[0-9][0-9A-Za-z.+_-]*$ || ! "$commit" =~ ^[0-9A-Za-z._-]+$ || ! "$build_date" =~ ^[0-9A-Za-z.:+_-]+$ ]]; then
+  echo "invalid version, commit or build date" >&2; exit 1
+fi
 if [[ -z "$os_label" ]]; then
   case "$(uname -s)" in
     Linux) os_label="linux" ;;
@@ -95,6 +99,10 @@ ldflags="-s -w -X main.version=${normalized_version} -X main.commit=${commit} -X
 bash "$(dirname "$0")/go-native.sh" build -ldflags "$ldflags" -o "${stage_dir}/idrive-gateway" ./cmd/idrive-gateway
 cp LICENSE "${stage_dir}/LICENSE"
 cp README.md "${stage_dir}/README.md"
+mkdir -p "${stage_dir}/docs" "${stage_dir}/scripts" "${stage_dir}/patches"
+cp docs/*.md "${stage_dir}/docs/"
+cp scripts/setup-rclone.sh scripts/configure-rclone.py scripts/build-idrive-rclone.sh "${stage_dir}/scripts/"
+cp patches/* "${stage_dir}/patches/"
 
 rm -f "$archive_path"
 tar -C "$artifact_dir" -czf "$archive_path" "$artifact_base"

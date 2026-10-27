@@ -23,6 +23,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"golang.org/x/sync/singleflight"
 	"idrive-unlimited/internal/session"
@@ -36,10 +37,11 @@ const (
 )
 
 var (
-	ErrNotFound     = errors.New("idrive: not found")
-	ErrUnauthorized = errors.New("idrive: unauthorized")
-	ErrReadOnly     = errors.New("idrive: read-only path")
-	ErrIsDirectory  = errors.New("idrive: is a directory")
+	ErrNotFound        = errors.New("idrive: not found")
+	ErrUnauthorized    = errors.New("idrive: unauthorized")
+	ErrReadOnly        = errors.New("idrive: read-only path")
+	ErrIsDirectory     = errors.New("idrive: is a directory")
+	ErrUnsupportedPath = errors.New("idrive: raw path ends in whitespace; use the documented rclone filename encoding")
 )
 
 type Client struct {
@@ -48,6 +50,9 @@ type Client struct {
 	jar             http.CookieJar
 	httpClient      *http.Client
 	cacheIdentity   string
+	sessionID       string
+	instanceID      string
+	journal         *uploadJournal
 	cacheGeneration uint64
 	uploadMu        sync.Mutex
 
@@ -100,14 +105,16 @@ type uploadSessionReply struct {
 }
 
 type Node struct {
-	Path     string
-	Name     string
-	IsDir    bool
-	Size     int64
-	ModTime  time.Time
-	Version  string
-	Device   *DeviceMeta
-	RawEntry browseContent
+	ReadOnly       bool
+	RootClassKnown bool
+	Path           string
+	Name           string
+	IsDir          bool
+	Size           int64
+	ModTime        time.Time
+	Version        string
+	Device         *DeviceMeta
+	RawEntry       browseContent
 }
 
 func NewClient(serverHost string, jar http.CookieJar) (*Client, error) {
@@ -129,8 +136,14 @@ func NewClient(serverHost string, jar http.CookieJar) (*Client, error) {
 	if err != nil {
 		return nil, err
 	}
+	instanceID, err := randomUploadID()
+	if err != nil {
+		return nil, err
+	}
 	return &Client{
-		cacheIdentity: identity,
+		cacheIdentity: fmt.Sprintf("%x", sha256.Sum256([]byte(serverHost+"|"+identity))),
+		sessionID:     identity,
+		instanceID:    instanceID,
 		serverHost:    serverHost,
 		baseURL:       "https://" + serverHost,
 		jar:           jar,
@@ -152,13 +165,32 @@ func NewClientFromSession(data *session.Data) (*Client, error) {
 	if err != nil {
 		return nil, err
 	}
-	return NewClient(data.ServerHost, jar)
+	c, err := NewClient(data.ServerHost, jar)
+	if err != nil {
+		return nil, err
+	}
+	if data.ID != "" {
+		c.sessionID = data.ID
+		sum := sha256.Sum256([]byte(data.ServerHost + "|" + data.ID))
+		c.cacheIdentity = hex.EncodeToString(sum[:])
+	}
+	return c, nil
 }
 
 func (c *Client) SessionData() (*session.Data, error) {
-	return session.FromCookieJar(c.serverHost, c.jar)
+	data, err := session.FromCookieJar(c.serverHost, c.jar)
+	if err != nil {
+		return nil, err
+	}
+	data.ID = c.sessionID
+	return data, nil
 }
 func (c *Client) CacheIdentity() string { return c.cacheIdentity }
+func (c *Client) Revision() string {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return fmt.Sprintf("%s-%d", c.instanceID, c.cacheGeneration)
+}
 func sessionIdentity(host string, jar http.CookieJar) (string, error) {
 	var keys []string
 	for _, p := range []string{"/", "/evs/"} {
@@ -237,21 +269,40 @@ func (c *Client) BrowseFresh(ctx context.Context, remotePath string) ([]Node, er
 	}
 
 	nodes := make([]Node, 0, len(resp.Contents))
+	if resp.Path != "" && CleanPath(resp.Path) != clean {
+		return nil, fmt.Errorf("browse response path differs from requested directory")
+	}
+	seen := make(map[string]bool, len(resp.Contents))
 	for _, entry := range resp.Contents {
+		if entry.Name == "" || entry.Name == "." || entry.Name == ".." || strings.ContainsAny(entry.Name, "/\x00") || seen[entry.Name] {
+			return nil, fmt.Errorf("invalid or duplicate name in browse response")
+		}
+		seen[entry.Name] = true
+		if !entry.IsDir {
+			if size, err := strconv.ParseInt(entry.Size, 10, 64); err != nil || size < 0 {
+				return nil, fmt.Errorf("invalid file size in browse response")
+			}
+		}
 		node := Node{
-			Path:     joinClean(resp.Path, entry.Name),
-			Name:     entry.Name,
-			IsDir:    entry.IsDir,
-			Size:     parseSize(entry.Size),
-			ModTime:  parseModTime(entry.LMD, entry.SaveTime),
-			Version:  entry.Version,
-			RawEntry: entry,
+			RootClassKnown: clean != "/" || resp.Devices != nil,
+			Path:           joinClean(clean, entry.Name),
+			Name:           entry.Name,
+			IsDir:          entry.IsDir,
+			Size:           parseSize(entry.Size),
+			ModTime:        parseModTime(entry.LMD, entry.SaveTime),
+			Version:        entry.Version,
+			RawEntry:       entry,
 		}
 		if clean == "/" {
 			if device, ok := resp.Devices[entry.Name]; ok {
 				deviceCopy := device
 				node.Device = &deviceCopy
 			}
+		}
+		if err := c.requireWritable(ctx, node.Path, false); errors.Is(err, ErrReadOnly) {
+			node.ReadOnly = true
+		} else if err != nil {
+			return nil, err
 		}
 		nodes = append(nodes, node)
 	}
@@ -306,11 +357,19 @@ func (c *Client) Stat(ctx context.Context, remotePath string) (Node, error) {
 
 func (c *Client) Mkdir(ctx context.Context, remotePath string) error {
 	clean := CleanPath(remotePath)
-	if clean == "/" {
-		return nil
+	if err := mutablePath(clean); err != nil {
+		return err
 	}
-	if IsReadOnlyPath(clean) {
-		return ErrReadOnly
+	if clean == "/" {
+		return fs.ErrExist
+	}
+	if _, err := c.StatFresh(ctx, clean); err == nil {
+		return fs.ErrExist
+	} else if !errors.Is(err, ErrNotFound) {
+		return err
+	}
+	if err := c.requireWritable(ctx, clean, true); err != nil {
+		return err
 	}
 
 	values := url.Values{}
@@ -332,14 +391,20 @@ func (c *Client) Mkdir(ctx context.Context, remotePath string) error {
 func (c *Client) Rename(ctx context.Context, oldPath, newPath string) error {
 	oldClean := CleanPath(oldPath)
 	newClean := CleanPath(newPath)
+	if err := errors.Join(mutablePath(oldClean), mutablePath(newClean)); err != nil {
+		return err
+	}
 	if oldClean == newClean {
 		return nil
 	}
 	if oldClean == "/" || newClean == "/" {
 		return fmt.Errorf("cannot rename the root directory")
 	}
-	if IsReadOnlyPath(oldClean) || IsReadOnlyPath(newClean) {
-		return ErrReadOnly
+	if err := errors.Join(c.requireWritable(ctx, oldClean, true), c.requireWritable(ctx, newClean, true)); err != nil {
+		return err
+	}
+	if err := c.protectDeviceRoot(ctx, oldClean); err != nil {
+		return err
 	}
 	if _, err := c.StatFresh(ctx, newClean); err == nil {
 		return fs.ErrExist
@@ -379,8 +444,17 @@ func (c *Client) Rename(ctx context.Context, oldPath, newPath string) error {
 func (c *Client) Copy(ctx context.Context, sourcePath, destinationDir string) error {
 	sourceClean := CleanPath(sourcePath)
 	destClean := CleanPath(destinationDir)
-	if IsReadOnlyPath(sourceClean) || IsReadOnlyPath(destClean) {
+	if err := errors.Join(mutablePath(sourceClean), mutablePath(destClean)); err != nil {
+		return err
+	}
+	if destClean == sourceClean || strings.HasPrefix(destClean, sourceClean+"/") {
+		return fs.ErrInvalid
+	}
+	if sourceClean == "/" {
 		return ErrReadOnly
+	}
+	if err := errors.Join(c.requireWritable(ctx, sourceClean, true), c.requireWritable(ctx, destClean, true)); err != nil {
+		return err
 	}
 
 	targetPath := joinClean(destClean, path.Base(sourceClean))
@@ -409,8 +483,17 @@ func (c *Client) Copy(ctx context.Context, sourcePath, destinationDir string) er
 func (c *Client) Move(ctx context.Context, sourcePath, destinationDir string) error {
 	sourceClean := CleanPath(sourcePath)
 	destClean := CleanPath(destinationDir)
-	if IsReadOnlyPath(sourceClean) || IsReadOnlyPath(destClean) {
-		return ErrReadOnly
+	if err := errors.Join(mutablePath(sourceClean), mutablePath(destClean)); err != nil {
+		return err
+	}
+	if destClean == sourceClean || strings.HasPrefix(destClean, sourceClean+"/") {
+		return fs.ErrInvalid
+	}
+	if err := c.protectDeviceRoot(ctx, sourceClean); err != nil {
+		return err
+	}
+	if err := errors.Join(c.requireWritable(ctx, sourceClean, true), c.requireWritable(ctx, destClean, true)); err != nil {
+		return err
 	}
 
 	targetPath := joinClean(destClean, path.Base(sourceClean))
@@ -441,11 +524,17 @@ func (c *Client) Move(ctx context.Context, sourcePath, destinationDir string) er
 
 func (c *Client) Delete(ctx context.Context, remotePath string) error {
 	clean := CleanPath(remotePath)
+	if err := mutablePath(clean); err != nil {
+		return err
+	}
 	if clean == "/" {
 		return fmt.Errorf("cannot delete the root directory")
 	}
-	if IsReadOnlyPath(clean) {
-		return ErrReadOnly
+	if err := c.requireWritable(ctx, clean, true); err != nil {
+		return err
+	}
+	if err := c.protectDeviceRoot(ctx, clean); err != nil {
+		return err
 	}
 
 	values := url.Values{}
@@ -484,7 +573,7 @@ func (c *Client) Download(ctx context.Context, remotePath string) (io.ReadCloser
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		resp.Body.Close()
-		return nil, fmt.Errorf("download %s: unexpected status %s", clean, resp.Status)
+		return nil, fmt.Errorf("download %s: unexpected status %d", clean, resp.StatusCode)
 	}
 	return resp.Body, nil
 }
@@ -913,6 +1002,12 @@ func min64(a, b int64) int64 {
 func cloneNodes(nodes []Node) []Node {
 	cloned := make([]Node, len(nodes))
 	copy(cloned, nodes)
+	for i := range cloned {
+		if cloned[i].Device != nil {
+			copy := *cloned[i].Device
+			cloned[i].Device = &copy
+		}
+	}
 	return cloned
 }
 
@@ -941,10 +1036,41 @@ func (c *Client) storeBrowse(remotePath string, nodes []Node, devices map[string
 			c.devices[key] = value
 		}
 	}
+	// Bound metadata retained when browsing many distinct directories.
+	if len(c.browseCache) >= 1024 {
+		for name, entry := range c.browseCache {
+			if time.Now().After(entry.expiresAt) {
+				delete(c.browseCache, name)
+			}
+		}
+		if len(c.browseCache) >= 1024 {
+			for name := range c.browseCache {
+				delete(c.browseCache, name)
+				break
+			}
+		}
+	}
 	c.browseCache[remotePath] = browseCacheEntry{
 		nodes:     cloneNodes(nodes),
 		expiresAt: time.Now().Add(browseCacheTTL),
 	}
+}
+
+func (c *Client) protectDeviceRoot(ctx context.Context, name string) error {
+	if name == "/" {
+		return ErrReadOnly
+	}
+	if ParentDir(name) != "/" {
+		return nil
+	}
+	node, err := c.StatFresh(ctx, name)
+	if err != nil {
+		return err
+	}
+	if node.Device != nil || (node.IsDir && !node.RootClassKnown) {
+		return ErrReadOnly
+	}
+	return nil
 }
 
 func (c *Client) invalidatePaths(paths ...string) {
@@ -1018,7 +1144,7 @@ func randomUploadID() (string, error) {
 }
 
 func CleanPath(remotePath string) string {
-	normalized := strings.ReplaceAll(strings.TrimSpace(remotePath), "\\", "/")
+	normalized := remotePath
 	if normalized == "" {
 		return "/"
 	}
@@ -1030,6 +1156,18 @@ func CleanPath(remotePath string) string {
 		return "/"
 	}
 	return clean
+}
+
+// The rename/delete APIs trim whitespace even though upload/download can accept
+// it. Refuse ambiguous raw mutation paths; rclone encodes these components.
+func mutablePath(name string) error {
+	for _, component := range strings.Split(name, "/") {
+		last, _ := utf8.DecodeLastRuneInString(component)
+		if strings.ContainsRune(" \t\r\n\v\f", last) {
+			return ErrUnsupportedPath
+		}
+	}
+	return nil
 }
 
 func ParentDir(remotePath string) string {
@@ -1079,4 +1217,29 @@ func readAPIResponse(r io.Reader) ([]byte, error) {
 		return nil, fmt.Errorf("IDrive API response exceeds 64 MiB")
 	}
 	return data, nil
+}
+
+// Only actual device-backed special folders are read-only. A normal user folder
+// named Contacts, SMS, etc. has ordinary filesystem semantics.
+func (c *Client) requireWritable(ctx context.Context, name string, fresh bool) error {
+	if !IsReadOnlyPath(name) {
+		return nil
+	}
+	var roots []Node
+	var err error
+	if fresh {
+		roots, err = c.BrowseFresh(ctx, "/")
+	} else {
+		roots, err = c.Browse(ctx, "/")
+	}
+	if err != nil {
+		return err
+	}
+	head := strings.Split(strings.TrimPrefix(CleanPath(name), "/"), "/")[0]
+	for _, root := range roots {
+		if root.Name == head && (root.Device != nil || (root.IsDir && !root.RootClassKnown)) {
+			return ErrReadOnly
+		}
+	}
+	return nil
 }

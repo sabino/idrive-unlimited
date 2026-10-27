@@ -17,7 +17,7 @@ bash scripts/build-idrive-rclone.sh "$HOME/.local/bin/idrive-rclone"
 The script verifies the pinned source archive's SHA-256 before extraction, applies
 the patch without fuzz, and uses Go module checksum verification. It also writes
 the upstream license next to the binary. The companion reports
-`v1.75.2-idrive.1`. With `govulncheck` on PATH, set `IDRIVE_RCLONE_VERIFY=1` to
+`v1.75.2-idrive.2`. With `govulncheck` on PATH, set `IDRIVE_RCLONE_VERIFY=1` to
 scan its reachable source before building. Do not disable Go's checksum database.
 
 Reuse the existing gateway session and WebDAV remote configuration. Start the
@@ -29,7 +29,8 @@ idrive-gateway serve --no-login --dav-user idrive \
   --dav-pass-file "$HOME/.config/idrive-gateway/local-webdav-password"
 
 idrive-rclone mount idrive-local: "$HOME/mnt/idrive" \
-  --webdav-idrive-safe-move --vfs-cache-mode full --vfs-cache-max-size 4G \
+  --webdav-idrive-safe-move --webdav-encoding Slash,Dot,Ctl,Del,RightSpace,RightCrLfHtVt,InvalidUtf8 \
+  --vfs-cache-mode full --vfs-cache-max-size 4G \
   --dir-cache-time 30s --attr-timeout 1s --poll-interval 0 --no-modtime
 ```
 
@@ -54,8 +55,7 @@ extra upload and readbacks cost bandwidth and time; replacements are limited to
 2,000,000,000 bytes and require local staging space. Existing directory targets
 are rejected. Plain COPY/MOVE requests still reject collisions.
 
-EVS does not supply an atomic replacement or conditional delete. A process crash
-or failed final source removal can leave duplicates; ambiguous promotion results
+EVS does not supply an atomic replacement or conditional delete. Persistent transaction recovery reconciles interrupted replacements on restart. A failed final source removal can still leave duplicates; ambiguous promotion results
 can leave the original target at a `.idrive-gateway-backup-*` recovery path.
 Inspect the error and recovery paths before retrying. Concurrent modifications
 from the website or another gateway are outside this process's lock. See
@@ -74,3 +74,15 @@ IDRIVE_RCLONE_FUSE_TEST=1 go test -race ./internal/webdav -run 'TestCompanion|Te
 
 These tests mount a disposable local fixture and verify successful and failed
 replacement, including the VFS view after failure. They require no IDrive login.
+
+See the [reliability review](reliability-review-2026-10-27.md) for journal recovery, request preconditions and private setup-helper configuration.
+
+The supported profile uses rclone's reversible encoding for trailing whitespace,
+control characters and invalid UTF-8. Local names retain their spelling; IDrive's
+website displays encoding symbols in the stored names. Use the same encoding for
+all commands against that remote. The companion refuses listings with names
+that cannot round-trip, preventing an existing raw name from silently selecting
+another file. A separate `--webdav-encoding None --read-only` profile can inspect
+legacy raw names. Raw mutations containing trailing ASCII whitespace are refused
+because the provider trims those paths. The private setup helper writes the
+supported encoding into its dedicated config automatically.

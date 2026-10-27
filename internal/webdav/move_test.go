@@ -212,3 +212,28 @@ func TestCompanionMove(t *testing.T) {
 		}
 	})
 }
+
+func TestCompanionEncodingIsReversibleAndRejectsAmbiguity(t *testing.T) {
+	binary := os.Getenv("IDRIVE_RCLONE_TEST_BINARY")
+	if binary == "" {
+		t.Skip("requires companion executable")
+	}
+	for _, raw := range []string{" spaced.txt␠", "unsafe.txt "} {
+		t.Run(raw, func(t *testing.T) {
+			s := testevs.New(t)
+			s.Add("/"+raw, []byte("data"))
+			c, _ := evs.NewClient(s.Host, nil)
+			server := httptest.NewServer(NewHandler(New(c, "/"), nil))
+			defer server.Close()
+			cmd := exec.Command(binary, "lsf", ":webdav:", "--webdav-url", server.URL, "--webdav-encoding", "Slash,Dot,Ctl,Del,RightSpace,RightCrLfHtVt,InvalidUtf8", "--config", os.DevNull)
+			out, err := cmd.CombinedOutput()
+			if raw == "unsafe.txt " {
+				if err == nil || !strings.Contains(string(out), "cannot round-trip") {
+					t.Fatalf("ambiguous raw name was silently decoded: %v %s", err, out)
+				}
+			} else if err != nil || !strings.Contains(string(out), " spaced.txt \n") {
+				t.Fatalf("encoded name did not round-trip: %v %s", err, out)
+			}
+		})
+	}
+}

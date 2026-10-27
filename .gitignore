@@ -7,3 +7,5 @@ dist/
 dist-headless/
 dist-native/
 native-dist/
+
+__pycache__/

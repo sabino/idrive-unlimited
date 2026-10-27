@@ -33,6 +33,11 @@ archives:
     files:
       - LICENSE
       - README.md
+      - docs/*.md
+      - scripts/setup-rclone.*
+      - scripts/configure-rclone.py
+      - scripts/build-idrive-rclone.sh
+      - patches/*
 
 checksum:
   name_template: checksums-headless.txt

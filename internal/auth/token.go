@@ -14,6 +14,7 @@ import (
 )
 
 type tokenLoginPayload struct {
+	CallbackNonce string `json:"callback_nonce,omitempty"`
 	ServerAddress string `json:"serverAddress"`
 	URL           string `json:"url"`
 	RedirectURL   string `json:"redirect_url"`

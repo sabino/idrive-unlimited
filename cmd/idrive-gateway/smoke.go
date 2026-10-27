@@ -83,22 +83,19 @@ func runSmoke(ctx context.Context, args []string) (runErr error) {
 		return err
 	}
 
-	obscuredPass, err := runCommandCapture(ctx, "", "rclone", "obscure", password)
+	obscure := exec.CommandContext(ctx, "rclone", "obscure", "-")
+	obscure.Env = append(os.Environ(), "RCLONE_CONFIG="+os.DevNull)
+	obscure.Stdin = strings.NewReader(password + "\n")
+	obscured, err := obscure.Output()
 	if err != nil {
-		return err
+		return fmt.Errorf("obscure smoke bridge password: %w", err)
 	}
-	obscuredPass = strings.TrimSpace(obscuredPass)
-
-	if _, err := runCommandCapture(ctx, "", "rclone",
-		"--config", configPath,
-		"config", "create",
-		"idrive-smoke",
-		"webdav",
-		"url", "http://"+listener.Addr().String(),
-		"vendor", "other",
-		"user", "idrive",
-		"pass", obscuredPass,
-	); err != nil {
+	obscuredPass := strings.TrimSpace(string(obscured))
+	if obscuredPass == "" || strings.ContainsAny(obscuredPass, "\r\n") {
+		return fmt.Errorf("invalid obscured bridge password")
+	}
+	contents := fmt.Sprintf("[idrive-smoke]\ntype = webdav\nurl = http://%s/\nvendor = other\nuser = idrive\npass = %s\n", listener.Addr().String(), obscuredPass)
+	if err := os.WriteFile(configPath, []byte(contents), 0600); err != nil {
 		return err
 	}
 

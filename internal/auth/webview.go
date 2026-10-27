@@ -4,6 +4,7 @@ package auth
 
 import (
 	"context"
+	"crypto/subtle"
 	"encoding/json"
 	"fmt"
 	"strings"
@@ -28,6 +29,10 @@ func Login(ctx context.Context) (*session.Data, error) {
 }
 
 func waitForTokenLogin(ctx context.Context) (*tokenLoginPayload, error) {
+	nonce, err := callbackNonce()
+	if err != nil {
+		return nil, err
+	}
 	resultCh := make(chan *tokenLoginPayload, 1)
 	errCh := make(chan error, 1)
 	done := make(chan struct{})
@@ -59,31 +64,34 @@ func waitForTokenLogin(ctx context.Context) (*tokenLoginPayload, error) {
 		})
 	}
 
-	if err := w.Bind("idriveGatewayTokenReady", func(raw string) {
-		var payload tokenLoginPayload
-		if err := json.Unmarshal([]byte(raw), &payload); err != nil {
-			complete(nil, fmt.Errorf("decode token login payload: %w", err))
-			return
+	if err := w.Bind("idriveGatewayTokenReady", func(raw string) bool {
+		payload, err := tokenCallback(raw, nonce)
+		if err != nil {
+			return false
 		}
-		if payload.Token == "" || payload.SID == "" {
-			complete(nil, fmt.Errorf("received incomplete token login payload"))
-			return
-		}
-		complete(&payload, nil)
+		complete(payload, nil)
+		return true
 	}); err != nil {
 		return nil, fmt.Errorf("bind token callback: %w", err)
 	}
-
-	if err := w.Bind("idriveGatewayAuthError", func(message string) {
-		if strings.TrimSpace(message) == "" {
-			return
+	if err := w.Bind("idriveGatewayAuthError", func(raw string) bool {
+		if len(raw) > 4096 {
+			return false
 		}
-		complete(nil, fmt.Errorf("%s", message))
+		var payload struct {
+			Nonce string `json:"callback_nonce"`
+		}
+		if json.Unmarshal([]byte(raw), &payload) != nil || subtle.ConstantTimeCompare([]byte(payload.Nonce), []byte(nonce)) != 1 {
+			return false
+		}
+		complete(nil, fmt.Errorf("native IDrive login failed; retry the login window"))
+		return true
 	}); err != nil {
 		return nil, fmt.Errorf("bind error callback: %w", err)
 	}
+	encodedNonce, _ := json.Marshal(nonce)
+	w.Init(strings.ReplaceAll(authBootstrapJS, "__IDRIVE_GATEWAY_NONCE__", string(encodedNonce)))
 
-	w.Init(authBootstrapJS)
 	w.Navigate(loginURL)
 
 	go func() {
@@ -109,6 +117,8 @@ func waitForTokenLogin(ctx context.Context) (*tokenLoginPayload, error) {
 
 const authBootstrapJS = `
 (function () {
+  if (window.location.origin !== "https://www.idrive.com" || window.top !== window) { return; }
+  const callbackNonce = __IDRIVE_GATEWAY_NONCE__;
   if (window.__idriveGatewayAuthHookInstalled) {
     return;
   }
@@ -137,16 +147,16 @@ const authBootstrapJS = `
         return;
       }
       sent = true;
+      payload.callback_nonce = callbackNonce;
       window.idriveGatewayTokenReady(JSON.stringify(payload));
     } catch (err) {
-      console.error("idrive gateway token exchange failed", err);
+      console.error("idrive gateway token exchange failed");
     }
   }
 
   const notify = () => {
     tryTokenLogin().catch(function (err) {
-      const message = err && err.message ? err.message : String(err);
-      window.idriveGatewayAuthError(message);
+      window.idriveGatewayAuthError(JSON.stringify({callback_nonce: callbackNonce}));
     });
   };
 

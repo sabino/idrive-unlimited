@@ -17,11 +17,17 @@ import (
 // by the EVS API. Directory replacement is deliberately unsupported.
 func (c *Client) MoveReplace(ctx context.Context, source, dest string) error {
 	source, dest = CleanPath(source), CleanPath(dest)
+	if err := errors.Join(mutablePath(source), mutablePath(dest)); err != nil {
+		return err
+	}
 	if source == dest {
 		return nil
 	}
-	if IsReadOnlyPath(source) || IsReadOnlyPath(dest) || source == "/" || dest == "/" {
+	if source == "/" || dest == "/" {
 		return ErrReadOnly
+	}
+	if err := errors.Join(c.requireWritable(ctx, source, true), c.requireWritable(ctx, dest, true)); err != nil {
+		return err
 	}
 	node, err := c.StatFresh(ctx, source)
 	if err != nil {

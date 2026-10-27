@@ -40,6 +40,8 @@ Source: "{#SourceDir}\libgcc_s_seh-1.dll"; DestDir: "{app}"; Flags: ignoreversio
 Source: "{#SourceDir}\libwinpthread-1.dll"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#SourceDir}\README.md"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#SourceDir}\LICENSE"; DestDir: "{app}"; Flags: ignoreversion
+Source: "{#SourceDir}\docs\*"; DestDir: "{app}\docs"; Flags: ignoreversion recursesubdirs createallsubdirs
+Source: "{#SourceDir}\scripts\*"; DestDir: "{app}\scripts"; Flags: ignoreversion recursesubdirs createallsubdirs
 Source: "{#SourceDir}\MicrosoftEdgeWebView2Setup.exe"; Flags: dontcopy
 
 [Code]
@@ -48,7 +50,7 @@ const
 
 function QueryStringValue(RootKey: Integer; const Subkey, ValueName: string; var Value: string): Boolean;
 begin
-  Result := RegQueryStringValue(RootKey, Subkey, ValueName, Value) and (Trim(Value) <> '');
+  Result := RegQueryStringValue(RootKey, Subkey, ValueName, Value) and (Trim(Value) <> '') and (Trim(Value) <> '0.0.0.0');
 end;
 
 function HasWebView2Runtime(): Boolean;

@@ -15,12 +15,19 @@ func localPassword(password, filename string) (string, error) {
 	if password != "" {
 		return "", fmt.Errorf("use only one of --dav-pass and --dav-pass-file")
 	}
+	info, err := os.Stat(filename)
+	if err != nil {
+		return "", err
+	}
+	if !info.Mode().IsRegular() {
+		return "", fmt.Errorf("WebDAV password file must be regular")
+	}
 	f, err := os.Open(filename)
 	if err != nil {
 		return "", fmt.Errorf("open WebDAV password file: %w", err)
 	}
 	defer f.Close()
-	info, err := f.Stat()
+	info, err = f.Stat()
 	if err != nil {
 		return "", err
 	}
