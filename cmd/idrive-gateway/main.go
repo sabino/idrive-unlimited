@@ -9,9 +9,11 @@ import (
 	"flag"
 	"fmt"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -21,8 +23,6 @@ import (
 	"idrive-unlimited/internal/probe"
 	"idrive-unlimited/internal/session"
 	idrivewebdav "idrive-unlimited/internal/webdav"
-
-	netwebdav "golang.org/x/net/webdav"
 )
 
 var (
@@ -87,6 +87,7 @@ Notes:
 func runLogin(ctx context.Context, args []string) error {
 	fs := flag.NewFlagSet("login", flag.ContinueOnError)
 	storePath := fs.String("config", "", "session file path")
+	noLogin := fs.Bool("no-login", false, "fail instead of opening a login window")
 	force := fs.Bool("force", false, "ignore an existing valid session and open login again")
 	if err := fs.Parse(args); err != nil {
 		return err
@@ -107,6 +108,9 @@ func runLogin(ctx context.Context, args []string) error {
 		}
 	}
 
+	if *noLogin {
+		return fmt.Errorf("no valid session; run idrive-gateway login")
+	}
 	data, err := auth.Login(ctx)
 	if err != nil {
 		return err
@@ -123,6 +127,7 @@ func runLogin(ctx context.Context, args []string) error {
 func runProbe(ctx context.Context, args []string) error {
 	fs := flag.NewFlagSet("probe", flag.ContinueOnError)
 	storePath := fs.String("config", "", "session file path")
+	noLogin := fs.Bool("no-login", false, "fail instead of opening a login window")
 	rootPath := fs.String("root", "/", "mounted root path inside Cloud Backup")
 	scratchPath := fs.String("scratch", "/.idrive-gateway-probe", "temporary remote path used for capability tests")
 	jsonOut := fs.Bool("json", false, "print the full probe report as JSON")
@@ -130,7 +135,7 @@ func runProbe(ctx context.Context, args []string) error {
 		return err
 	}
 
-	client, _, err := ensureClient(ctx, *storePath, true)
+	client, _, err := ensureClient(ctx, *storePath, !*noLogin)
 	if err != nil {
 		return err
 	}
@@ -151,6 +156,7 @@ func runProbe(ctx context.Context, args []string) error {
 func runServe(ctx context.Context, args []string) error {
 	fs := flag.NewFlagSet("serve", flag.ContinueOnError)
 	storePath := fs.String("config", "", "session file path")
+	noLogin := fs.Bool("no-login", false, "fail instead of opening a login window")
 	rootPath := fs.String("root", "/", "mounted root path inside Cloud Backup")
 	listenAddr := fs.String("listen", "127.0.0.1:8787", "loopback listen address")
 	davUser := fs.String("dav-user", "idrive", "basic auth username for the local WebDAV server")
@@ -159,7 +165,12 @@ func runServe(ctx context.Context, args []string) error {
 		return err
 	}
 
-	client, data, err := ensureClient(ctx, *storePath, true)
+	safeAddr, err := loopbackAddress(*listenAddr)
+	if err != nil {
+		return err
+	}
+	*listenAddr = safeAddr
+	client, data, err := ensureClient(ctx, *storePath, !*noLogin)
 	if err != nil {
 		return err
 	}
@@ -173,15 +184,11 @@ func runServe(ctx context.Context, args []string) error {
 	}
 
 	fileSystem := idrivewebdav.New(client, *rootPath)
-	handler := &netwebdav.Handler{
-		FileSystem: fileSystem,
-		LockSystem: netwebdav.NewMemLS(),
-		Logger: func(req *http.Request, err error) {
-			if err != nil && !errors.Is(err, evs.ErrNotFound) {
-				log.Printf("%s %s -> %v", req.Method, req.URL.Path, err)
-			}
-		},
-	}
+	handler := idrivewebdav.NewHandler(fileSystem, func(req *http.Request, err error) {
+		if err != nil && !errors.Is(err, evs.ErrNotFound) {
+			log.Printf("%s %s -> %v", req.Method, req.URL.Path, err)
+		}
+	})
 
 	server := &http.Server{
 		Addr:              *listenAddr,
@@ -224,18 +231,38 @@ func ensureClient(ctx context.Context, storePath string, interactive bool) (*evs
 		return nil, nil, err
 	}
 
-	if data, err := store.Load(); err == nil {
+	data, loadErr := store.Load()
+	var sessionErr error
+	if loadErr == nil {
 		client, err := evs.NewClientFromSession(data)
-		if err == nil && client.Validate(ctx) == nil {
-			return client, data, nil
+		if err != nil {
+			return nil, nil, fmt.Errorf("load session: %w", err)
 		}
+		if err := client.Validate(ctx); err == nil {
+			updated, err := client.SessionData()
+			if err != nil {
+				return nil, nil, err
+			}
+			if err := store.Save(updated); err != nil {
+				return nil, nil, err
+			}
+			return client, updated, nil
+		} else {
+			sessionErr = err
+			if !errors.Is(err, evs.ErrUnauthorized) {
+				return nil, nil, fmt.Errorf("validate saved session: %w", err)
+			}
+		}
+	} else if !errors.Is(loadErr, os.ErrNotExist) {
+		return nil, nil, fmt.Errorf("load session %s: %w", store.Path, loadErr)
+	} else {
+		sessionErr = loadErr
 	}
-
 	if !interactive {
-		return nil, nil, fmt.Errorf("no valid session found; run `idrive-gateway login` first")
+		return nil, nil, fmt.Errorf("no valid session; run idrive-gateway login: %w", sessionErr)
 	}
 
-	data, err := auth.Login(ctx)
+	data, err = auth.Login(ctx)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -297,4 +324,23 @@ func printProbeReport(report *probe.Report) {
 
 func printVersion() {
 	fmt.Printf("idrive-gateway version=%s commit=%s date=%s\n", version, commit, date)
+}
+
+func loopbackAddress(addr string) (string, error) {
+	host, port, err := net.SplitHostPort(addr)
+	if err != nil {
+		return "", fmt.Errorf("invalid loopback listen address: %w", err)
+	}
+	n, err := strconv.Atoi(port)
+	if err != nil || n < 0 || n > 65535 {
+		return "", fmt.Errorf("invalid listen port")
+	}
+	if strings.EqualFold(host, "localhost") {
+		host = "127.0.0.1"
+	}
+	ip := net.ParseIP(host)
+	if ip == nil || !ip.IsLoopback() {
+		return "", fmt.Errorf("listen address must be an explicit loopback IP or localhost")
+	}
+	return net.JoinHostPort(host, port), nil
 }

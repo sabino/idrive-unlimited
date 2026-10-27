@@ -167,7 +167,7 @@ Linux full builds need:
 Generic build command:
 
 ```bash
-CGO_ENABLED=1 go build -o idrive-gateway ./cmd/idrive-gateway
+bash scripts/go-native.sh build -o idrive-gateway ./cmd/idrive-gateway
 ```
 
 On Debian/Ubuntu-like systems, the package names are typically:
@@ -176,12 +176,18 @@ On Debian/Ubuntu-like systems, the package names are typically:
 sudo apt-get install -y build-essential pkg-config libgtk-3-dev libwebkit2gtk-4.1-dev
 ```
 
-Some distros package WebKitGTK as `4.0` instead of `4.1`; the upstream `webview` library supports either runtime family.
+The pinned Go webview binding requests the `4.0` pkg-config name. On systems with only WebKitGTK `4.1`, use the repository helper below; it supplies a temporary compatibility alias and cleans it up afterward.
 
 Native Linux release packaging command:
 
 ```bash
 bash ./scripts/package-native-posix.sh --version 0.1.0 --os-label linux --arch-label amd64
+```
+
+Native tests and race detection use the same helper:
+
+```bash
+bash scripts/go-native.sh test -race ./...
 ```
 
 ## macOS build notes
@@ -294,3 +300,5 @@ Notes:
 - Device-backed top-level roots are exposed with friendly names and their root names are not renamable.
 
 See `docs/rclone.md` for `rclone` usage.
+
+See [write safety and local operation](docs/safety.md) for verified replacement behavior, recovery copies, cache limits, unattended session reuse, and writable mounts.

@@ -5,14 +5,17 @@ import (
 	"context"
 	"crypto/md5"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"mime/multipart"
 	"net/http"
-	"net/http/cookiejar"
+	"sort"
+
 	"net/url"
 	"os"
 	"path"
@@ -40,10 +43,13 @@ var (
 )
 
 type Client struct {
-	serverHost string
-	baseURL    string
-	jar        http.CookieJar
-	httpClient *http.Client
+	serverHost      string
+	baseURL         string
+	jar             http.CookieJar
+	httpClient      *http.Client
+	cacheIdentity   string
+	cacheGeneration uint64
+	uploadMu        sync.Mutex
 
 	mu          sync.RWMutex
 	devices     map[string]DeviceMeta
@@ -110,18 +116,24 @@ func NewClient(serverHost string, jar http.CookieJar) (*Client, error) {
 	}
 	if jar == nil {
 		var err error
-		jar, err = cookiejar.New(nil)
+		jar, err = session.NewJar()
 		if err != nil {
 			return nil, err
 		}
 	}
+	identity, err := sessionIdentity(serverHost, jar)
+	if err != nil {
+		return nil, err
+	}
 	return &Client{
-		serverHost: serverHost,
-		baseURL:    "https://" + serverHost,
-		jar:        jar,
+		cacheIdentity: identity,
+		serverHost:    serverHost,
+		baseURL:       "https://" + serverHost,
+		jar:           jar,
 		httpClient: &http.Client{
-			Jar:     jar,
-			Timeout: 2 * time.Minute,
+			Jar:           jar,
+			Timeout:       2 * time.Minute,
+			CheckRedirect: func(req *http.Request, via []*http.Request) error { return http.ErrUseLastResponse },
 		},
 		devices:     make(map[string]DeviceMeta),
 		browseCache: make(map[string]browseCacheEntry),
@@ -139,12 +151,29 @@ func NewClientFromSession(data *session.Data) (*Client, error) {
 	return NewClient(data.ServerHost, jar)
 }
 
-func (c *Client) SessionData() *session.Data {
-	data, err := session.FromCookieJar(c.serverHost, c.jar)
-	if err != nil {
-		return &session.Data{ServerHost: c.serverHost}
+func (c *Client) SessionData() (*session.Data, error) {
+	return session.FromCookieJar(c.serverHost, c.jar)
+}
+func (c *Client) CacheIdentity() string { return c.cacheIdentity }
+func sessionIdentity(host string, jar http.CookieJar) (string, error) {
+	var keys []string
+	for _, p := range []string{"/", "/evs/"} {
+		u, err := url.Parse("https://" + host + p)
+		if err != nil {
+			return "", err
+		}
+		for _, cookie := range jar.Cookies(u) {
+			keys = append(keys, cookie.Name+"="+cookie.Value)
+		}
 	}
-	return data
+	if len(keys) == 0 {
+		id, err := randomUploadID()
+		return id, err
+	}
+	sort.Strings(keys)
+	raw, _ := json.Marshal([]any{host, keys})
+	sum := sha256.Sum256(raw)
+	return hex.EncodeToString(sum[:]), nil
 }
 
 func (c *Client) ServerHost() string {
@@ -152,64 +181,95 @@ func (c *Client) ServerHost() string {
 }
 
 func (c *Client) Validate(ctx context.Context) error {
-	_, err := c.Browse(ctx, "/")
+	_, err := c.BrowseFresh(ctx, "/")
 	return err
 }
 
 func (c *Client) Browse(ctx context.Context, remotePath string) ([]Node, error) {
 	clean := CleanPath(remotePath)
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	if nodes, ok := c.cachedBrowse(clean); ok {
 		return nodes, nil
 	}
-
-	result, err, _ := c.browseGroup.Do(clean, func() (any, error) {
+	result := c.browseGroup.DoChan(clean, func() (any, error) {
 		if nodes, ok := c.cachedBrowse(clean); ok {
 			return nodes, nil
 		}
-
-		values := url.Values{}
-		values.Set("p", clean)
-		values.Set("json", "yes")
-		values.Set("device_id", "")
-		if clean == "/" {
-			values.Set("devices", "yes")
-		}
-
-		var resp browseResponse
-		if err := c.postForm(ctx, "/evs/browseFolder", values, &resp); err != nil {
-			return nil, err
-		}
-		if !isSuccess(resp.Message) {
-			return nil, apiError(http.StatusOK, resp.Message, resp.Desc)
-		}
-
-		nodes := make([]Node, 0, len(resp.Contents))
-		for _, entry := range resp.Contents {
-			node := Node{
-				Path:     joinClean(resp.Path, entry.Name),
-				Name:     entry.Name,
-				IsDir:    entry.IsDir,
-				Size:     parseSize(entry.Size),
-				ModTime:  parseModTime(entry.LMD, entry.SaveTime),
-				Version:  entry.Version,
-				RawEntry: entry,
-			}
-			if clean == "/" {
-				if device, ok := resp.Devices[entry.Name]; ok {
-					deviceCopy := device
-					node.Device = &deviceCopy
-				}
-			}
-			nodes = append(nodes, node)
-		}
-
-		c.storeBrowse(clean, nodes, resp.Devices)
-		return cloneNodes(nodes), nil
+		return c.BrowseFresh(ctx, clean)
 	})
-	if err != nil {
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	case result := <-result:
+		if result.Err != nil {
+			return nil, result.Err
+		}
+		return result.Val.([]Node), nil
+	}
+}
+
+// BrowseFresh bypasses cached and in-flight listings for mutation verification.
+func (c *Client) BrowseFresh(ctx context.Context, remotePath string) ([]Node, error) {
+	clean := CleanPath(remotePath)
+	c.mu.RLock()
+	generation := c.cacheGeneration
+	c.mu.RUnlock()
+	values := url.Values{}
+	values.Set("p", clean)
+	values.Set("json", "yes")
+	values.Set("device_id", "")
+	if clean == "/" {
+		values.Set("devices", "yes")
+	}
+
+	var resp browseResponse
+	if err := c.postForm(ctx, "/evs/browseFolder", values, &resp); err != nil {
 		return nil, err
 	}
-	return result.([]Node), nil
+	if !isSuccess(resp.Message) {
+		return nil, apiError(http.StatusOK, resp.Message, resp.Desc)
+	}
+
+	nodes := make([]Node, 0, len(resp.Contents))
+	for _, entry := range resp.Contents {
+		node := Node{
+			Path:     joinClean(resp.Path, entry.Name),
+			Name:     entry.Name,
+			IsDir:    entry.IsDir,
+			Size:     parseSize(entry.Size),
+			ModTime:  parseModTime(entry.LMD, entry.SaveTime),
+			Version:  entry.Version,
+			RawEntry: entry,
+		}
+		if clean == "/" {
+			if device, ok := resp.Devices[entry.Name]; ok {
+				deviceCopy := device
+				node.Device = &deviceCopy
+			}
+		}
+		nodes = append(nodes, node)
+	}
+
+	c.storeBrowse(clean, nodes, resp.Devices, generation)
+	return cloneNodes(nodes), nil
+}
+func (c *Client) StatFresh(ctx context.Context, remotePath string) (Node, error) {
+	clean := CleanPath(remotePath)
+	if clean == "/" {
+		return c.Stat(ctx, clean)
+	}
+	nodes, err := c.BrowseFresh(ctx, ParentDir(clean))
+	if err != nil {
+		return Node{}, err
+	}
+	for _, node := range nodes {
+		if node.Name == path.Base(clean) {
+			return node, nil
+		}
+	}
+	return Node{}, ErrNotFound
 }
 
 func (c *Client) Stat(ctx context.Context, remotePath string) (Node, error) {
@@ -314,6 +374,12 @@ func (c *Client) Copy(ctx context.Context, sourcePath, destinationDir string) er
 		return ErrReadOnly
 	}
 
+	targetPath := joinClean(destClean, path.Base(sourceClean))
+	if _, err := c.StatFresh(ctx, targetPath); err == nil {
+		return fs.ErrExist
+	} else if !errors.Is(err, ErrNotFound) {
+		return err
+	}
 	values := url.Values{}
 	values.Add("fileFolderPaths", sourceClean)
 	values.Set("p", destClean)
@@ -323,7 +389,7 @@ func (c *Client) Copy(ctx context.Context, sourcePath, destinationDir string) er
 	if _, err := c.postFormRaw(ctx, "/evs/copyPasteFileFolder", values); err != nil {
 		return err
 	}
-	targetPath := joinClean(destClean, path.Base(sourceClean))
+	c.invalidatePaths(ParentDir(sourceClean), destClean, sourceClean, targetPath)
 	if err := c.waitForPathState(ctx, targetPath, true, 45*time.Second); err != nil {
 		return err
 	}
@@ -338,6 +404,12 @@ func (c *Client) Move(ctx context.Context, sourcePath, destinationDir string) er
 		return ErrReadOnly
 	}
 
+	targetPath := joinClean(destClean, path.Base(sourceClean))
+	if _, err := c.StatFresh(ctx, targetPath); err == nil {
+		return fs.ErrExist
+	} else if !errors.Is(err, ErrNotFound) {
+		return err
+	}
 	values := url.Values{}
 	values.Add("fileFolderPaths", sourceClean)
 	values.Set("p", destClean)
@@ -347,7 +419,7 @@ func (c *Client) Move(ctx context.Context, sourcePath, destinationDir string) er
 	if _, err := c.postFormRaw(ctx, "/evs/move", values); err != nil {
 		return err
 	}
-	targetPath := joinClean(destClean, path.Base(sourceClean))
+	c.invalidatePaths(ParentDir(sourceClean), destClean, sourceClean, targetPath)
 	if err := c.waitForPathState(ctx, targetPath, true, 45*time.Second); err != nil {
 		return err
 	}
@@ -387,7 +459,9 @@ func (c *Client) Download(ctx context.Context, remotePath string) (io.ReadCloser
 	if err != nil {
 		return nil, err
 	}
-	resp, err := c.httpClient.Do(req)
+	transferClient := *c.httpClient
+	transferClient.Timeout = 30 * time.Minute
+	resp, err := transferClient.Do(req)
 	if err != nil {
 		return nil, err
 	}
@@ -423,46 +497,7 @@ func (c *Client) DownloadToFile(ctx context.Context, remotePath, localPath strin
 	if _, err := io.Copy(file, rc); err != nil {
 		return err
 	}
-	return nil
-}
-
-func (c *Client) UploadFile(ctx context.Context, localPath, remotePath string, modTime time.Time) error {
-	clean := CleanPath(remotePath)
-	if IsReadOnlyPath(clean) {
-		return ErrReadOnly
-	}
-
-	info, err := os.Stat(localPath)
-	if err != nil {
-		return err
-	}
-	if info.IsDir() {
-		return ErrIsDirectory
-	}
-
-	if existing, err := c.Stat(ctx, clean); err == nil {
-		if existing.IsDir {
-			return ErrIsDirectory
-		}
-		if err := c.Delete(ctx, clean); err != nil {
-			return err
-		}
-	} else if !errors.Is(err, ErrNotFound) {
-		return err
-	}
-
-	if info.Size() < chunkEnableFileSize {
-		if err := c.uploadSmall(ctx, localPath, clean, modTime); err != nil {
-			return err
-		}
-		c.invalidatePaths(ParentDir(clean), clean)
-		return nil
-	}
-	if err := c.uploadChunked(ctx, localPath, clean, modTime); err != nil {
-		return err
-	}
-	c.invalidatePaths(ParentDir(clean), clean)
-	return nil
+	return file.Close()
 }
 
 func (c *Client) uploadSmall(ctx context.Context, localPath, remotePath string, modTime time.Time) error {
@@ -775,7 +810,7 @@ func checkHTTPStatus(statusCode int, body []byte) error {
 		return nil
 	}
 	message := strings.TrimSpace(string(body))
-	if statusCode == http.StatusUnauthorized || statusCode == http.StatusForbidden {
+	if statusCode == http.StatusUnauthorized || statusCode == http.StatusForbidden || (statusCode >= 300 && statusCode < 400) {
 		return ErrUnauthorized
 	}
 	if statusCode == http.StatusNotFound {
@@ -785,21 +820,17 @@ func checkHTTPStatus(statusCode int, body []byte) error {
 }
 
 func checkMaybeJSONReply(raw []byte) error {
-	trimmed := strings.TrimSpace(string(raw))
-	if trimmed == "" || !strings.HasPrefix(trimmed, "{") {
-		return nil
-	}
 	var reply apiReply
-	if err := json.Unmarshal([]byte(trimmed), &reply); err != nil {
-		return nil
+	if err := json.Unmarshal(raw, &reply); err != nil {
+		return fmt.Errorf("invalid mutation response: expected JSON success")
 	}
-	if reply.Message == "" {
-		return nil
+	if strings.TrimSpace(reply.Message) == "" {
+		return fmt.Errorf("invalid mutation response: missing message")
 	}
-	if isSuccess(reply.Message) {
-		return nil
+	if !isSuccess(reply.Message) {
+		return apiError(http.StatusOK, reply.Message, reply.Desc)
 	}
-	return apiError(http.StatusOK, reply.Message, reply.Desc)
+	return nil
 }
 
 func apiError(status int, message, desc string) error {
@@ -893,9 +924,12 @@ func (c *Client) cachedBrowse(remotePath string) ([]Node, bool) {
 	return cloneNodes(entry.nodes), true
 }
 
-func (c *Client) storeBrowse(remotePath string, nodes []Node, devices map[string]DeviceMeta) {
+func (c *Client) storeBrowse(remotePath string, nodes []Node, devices map[string]DeviceMeta, generation uint64) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	if generation != c.cacheGeneration {
+		return
+	}
 	if remotePath == "/" && devices != nil {
 		c.devices = make(map[string]DeviceMeta, len(devices))
 		for key, value := range devices {
@@ -911,8 +945,14 @@ func (c *Client) storeBrowse(remotePath string, nodes []Node, devices map[string
 func (c *Client) invalidatePaths(paths ...string) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	c.cacheGeneration++
 	for _, item := range paths {
-		delete(c.browseCache, CleanPath(item))
+		clean := CleanPath(item)
+		for cached := range c.browseCache {
+			if clean == "/" || cached == clean || strings.HasPrefix(cached, clean+"/") {
+				delete(c.browseCache, cached)
+			}
+		}
 	}
 }
 
@@ -935,9 +975,11 @@ func (c *Client) lookupCachedNode(parentPath, baseName string) (Node, bool) {
 }
 
 func (c *Client) waitForPathState(ctx context.Context, remotePath string, wantExists bool, maxWait time.Duration) error {
+	ctx, cancel := context.WithTimeout(ctx, maxWait)
+	defer cancel()
 	deadline := time.Now().Add(maxWait)
 	for {
-		_, err := c.Stat(ctx, remotePath)
+		_, err := c.StatFresh(ctx, remotePath)
 		exists := err == nil
 		if wantExists && exists {
 			return nil

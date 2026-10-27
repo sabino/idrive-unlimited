@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"time"
 
 	"golang.org/x/sync/singleflight"
 	"idrive-unlimited/internal/evs"
@@ -50,16 +51,23 @@ func cacheNamespace(raw string) string {
 		return "default"
 	}
 	sum := sha256.Sum256([]byte(trimmed))
-	return hex.EncodeToString(sum[:8])
+	return hex.EncodeToString(sum[:])
 }
 
 func (c *fileCache) Ensure(ctx context.Context, dl downloader, remotePath string, node evs.Node) (string, error) {
 	target := c.targetPath(remotePath, node)
+	if err := pruneFiles(c.rootDir, target, configuredBytes("IDRIVE_GATEWAY_CACHE_MAX_BYTES"), retentionAge); err != nil {
+		return "", err
+	}
 	if ok, err := cacheFileValid(target, node.Size); ok || err != nil {
+		if err == nil {
+			now := time.Now()
+			_ = os.Chtimes(target, now, now)
+		}
 		return target, err
 	}
 
-	result, err, _ := c.group.Do(target, func() (any, error) {
+	resultCh := c.group.DoChan(target, func() (any, error) {
 		if ok, err := cacheFileValid(target, node.Size); ok || err != nil {
 			return target, err
 		}
@@ -97,12 +105,18 @@ func (c *fileCache) Ensure(ctx context.Context, dl downloader, remotePath string
 			_ = os.Remove(tempPath)
 			return "", err
 		}
+		_ = pruneFiles(c.rootDir, target, configuredBytes("IDRIVE_GATEWAY_CACHE_MAX_BYTES"), retentionAge)
 		return target, nil
 	})
-	if err != nil {
-		return "", err
+	select {
+	case <-ctx.Done():
+		return "", ctx.Err()
+	case result := <-resultCh:
+		if result.Err != nil {
+			return "", result.Err
+		}
+		return result.Val.(string), nil
 	}
-	return result.(string), nil
 }
 
 func (c *fileCache) targetPath(remotePath string, node evs.Node) string {

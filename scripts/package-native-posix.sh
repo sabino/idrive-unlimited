@@ -77,14 +77,8 @@ archive_path="${artifact_dir}/${artifact_base}.tar.gz"
 rm -rf "$stage_dir"
 mkdir -p "$stage_dir"
 
-if [[ "$os_label" == "linux" ]] && pkg-config --exists webkit2gtk-4.1 && ! pkg-config --exists webkit2gtk-4.0; then
-  tmp_pkgconfig="$(mktemp -d)"
-  cp "$(pkg-config --variable=pcfiledir webkit2gtk-4.1)/webkit2gtk-4.1.pc" "${tmp_pkgconfig}/webkit2gtk-4.0.pc"
-  export PKG_CONFIG_PATH="${tmp_pkgconfig}${PKG_CONFIG_PATH:+:${PKG_CONFIG_PATH}}"
-fi
-
 ldflags="-s -w -X main.version=${normalized_version} -X main.commit=${commit} -X main.date=${build_date}"
-CGO_ENABLED=1 go build -ldflags "$ldflags" -o "${stage_dir}/idrive-gateway" ./cmd/idrive-gateway
+bash "$(dirname "$0")/go-native.sh" build -ldflags "$ldflags" -o "${stage_dir}/idrive-gateway" ./cmd/idrive-gateway
 cp LICENSE "${stage_dir}/LICENSE"
 cp README.md "${stage_dir}/README.md"
 

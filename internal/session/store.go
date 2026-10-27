@@ -5,7 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
-	"net/http/cookiejar"
+
 	"net/url"
 	"os"
 	"path/filepath"
@@ -16,13 +16,14 @@ import (
 const defaultFileName = "session.json"
 
 type Cookie struct {
-	Name     string    `json:"name"`
-	Value    string    `json:"value"`
-	Path     string    `json:"path,omitempty"`
-	Domain   string    `json:"domain,omitempty"`
-	Expires  time.Time `json:"expires,omitempty"`
-	Secure   bool      `json:"secure,omitempty"`
-	HTTPOnly bool      `json:"http_only,omitempty"`
+	Name       string    `json:"name"`
+	Value      string    `json:"value"`
+	Path       string    `json:"path,omitempty"`
+	Domain     string    `json:"domain,omitempty"`
+	Expires    time.Time `json:"expires,omitempty"`
+	Secure     bool      `json:"secure,omitempty"`
+	HTTPOnly   bool      `json:"http_only,omitempty"`
+	OriginHost string    `json:"origin_host,omitempty"`
 }
 
 type Data struct {
@@ -76,14 +77,30 @@ func (s *Store) Save(data *Data) error {
 	if err != nil {
 		return fmt.Errorf("encode session file: %w", err)
 	}
-	if err := os.WriteFile(s.Path, payload, 0o600); err != nil {
+	temp, err := os.CreateTemp(filepath.Dir(s.Path), ".session-*")
+	if err != nil {
+		return fmt.Errorf("create session file: %w", err)
+	}
+	defer os.Remove(temp.Name())
+	if _, err := temp.Write(payload); err != nil {
+		temp.Close()
 		return fmt.Errorf("write session file: %w", err)
+	}
+	if err := temp.Sync(); err != nil {
+		temp.Close()
+		return fmt.Errorf("sync session file: %w", err)
+	}
+	if err := temp.Close(); err != nil {
+		return err
+	}
+	if err := os.Rename(temp.Name(), s.Path); err != nil {
+		return fmt.Errorf("replace session file: %w", err)
 	}
 	return nil
 }
 
 func (d *Data) NewCookieJar() (http.CookieJar, error) {
-	jar, err := cookiejar.New(nil)
+	jar, err := NewJar()
 	if err != nil {
 		return nil, err
 	}
@@ -94,29 +111,21 @@ func (d *Data) NewCookieJar() (http.CookieJar, error) {
 }
 
 func (d *Data) ApplyToJar(jar http.CookieJar) error {
-	grouped := map[string][]*http.Cookie{}
 	for _, saved := range d.Cookies {
-		cookie := &http.Cookie{
-			Name:     saved.Name,
-			Value:    saved.Value,
-			Path:     saved.Path,
-			Domain:   saved.Domain,
-			Expires:  saved.Expires,
-			Secure:   saved.Secure,
-			HttpOnly: saved.HTTPOnly,
+		cookie := &http.Cookie{Name: saved.Name, Value: saved.Value, Path: saved.Path, Domain: saved.Domain, Expires: saved.Expires, Secure: saved.Secure, HttpOnly: saved.HTTPOnly}
+		requestPath := saved.Path
+		if !strings.HasPrefix(requestPath, "/") {
+			requestPath = "/"
 		}
-		requestPath := "/"
-		if strings.TrimSpace(saved.Path) != "" {
-			requestPath = saved.Path
+		host := saved.OriginHost
+		if host == "" {
+			host = d.ServerHost
 		}
-		grouped[requestPath] = append(grouped[requestPath], cookie)
-	}
-	for requestPath, cookies := range grouped {
-		u, err := url.Parse("https://" + d.ServerHost + requestPath)
+		u, err := url.Parse("https://" + host + requestPath)
 		if err != nil {
 			return err
 		}
-		jar.SetCookies(u, cookies)
+		jar.SetCookies(u, []*http.Cookie{cookie})
 	}
 	return nil
 }
@@ -132,34 +141,9 @@ func FromCookieJar(serverHost string, jar http.CookieJar) (*Data, error) {
 	if serverHost == "" {
 		return nil, errors.New("server host is required")
 	}
-	requestPaths := []string{"/", "/evs", "/evs/"}
-	seen := map[string]struct{}{}
-	saved := make([]Cookie, 0)
-	for _, requestPath := range requestPaths {
-		u, err := url.Parse("https://" + serverHost + requestPath)
-		if err != nil {
-			return nil, err
-		}
-		items := jar.Cookies(u)
-		for _, item := range items {
-			key := item.Name + "\x00" + item.Path + "\x00" + item.Domain
-			if _, ok := seen[key]; ok {
-				continue
-			}
-			seen[key] = struct{}{}
-			saved = append(saved, Cookie{
-				Name:     item.Name,
-				Value:    item.Value,
-				Path:     item.Path,
-				Domain:   item.Domain,
-				Expires:  item.Expires,
-				Secure:   item.Secure,
-				HTTPOnly: item.HttpOnly,
-			})
-		}
+	persistent, ok := jar.(*Jar)
+	if !ok {
+		return nil, errors.New("cookie jar does not preserve cookie attributes; use session.NewJar")
 	}
-	return &Data{
-		ServerHost: serverHost,
-		Cookies:    saved,
-	}, nil
+	return &Data{ServerHost: serverHost, Cookies: persistent.snapshot(serverHost)}, nil
 }
