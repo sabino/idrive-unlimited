@@ -61,7 +61,7 @@ from the website or another gateway are outside this process's lock. See
 ## Verification
 
 CI builds the pinned patch and exercises real `moveto` commands against a local
-EVS fixture, including upload failure, refusal of an incompatible server and
+EVS fixture, including native rename failure, refusal of an incompatible server and
 absence of destination DELETE. On Linux with `/dev/fuse`, run:
 
 ```sh
