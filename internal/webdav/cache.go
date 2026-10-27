@@ -10,8 +10,9 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
+	"time"
 
-	"golang.org/x/sync/singleflight"
 	"idrive-unlimited/internal/evs"
 )
 
@@ -24,7 +25,8 @@ type downloader interface {
 type fileCache struct {
 	rootDir   string
 	namespace string
-	group     singleflight.Group
+	mu        sync.Mutex
+	flights   map[string]*cacheFlight
 }
 
 func newFileCache(namespace string) *fileCache {
@@ -50,59 +52,103 @@ func cacheNamespace(raw string) string {
 		return "default"
 	}
 	sum := sha256.Sum256([]byte(trimmed))
-	return hex.EncodeToString(sum[:8])
+	return hex.EncodeToString(sum[:])
 }
 
 func (c *fileCache) Ensure(ctx context.Context, dl downloader, remotePath string, node evs.Node) (string, error) {
+	if err := ctx.Err(); err != nil {
+		return "", err
+	}
 	target := c.targetPath(remotePath, node)
+	if err := pruneFiles(c.rootDir, target, configuredBytes("IDRIVE_GATEWAY_CACHE_MAX_BYTES"), retentionAge); err != nil {
+		return "", err
+	}
 	if ok, err := cacheFileValid(target, node.Size); ok || err != nil {
+		if err == nil {
+			now := time.Now()
+			_ = os.Chtimes(target, now, now)
+		}
 		return target, err
 	}
 
-	result, err, _ := c.group.Do(target, func() (any, error) {
-		if ok, err := cacheFileValid(target, node.Size); ok || err != nil {
-			return target, err
+	c.mu.Lock()
+	if c.flights == nil {
+		c.flights = make(map[string]*cacheFlight)
+	}
+	if flight, ok := c.flights[target]; ok {
+		c.mu.Unlock()
+		select {
+		case <-ctx.Done():
+			return "", ctx.Err()
+		case <-flight.done:
+			return flight.path, flight.err
 		}
-		if err := os.MkdirAll(filepath.Dir(target), 0o700); err != nil {
-			return "", err
-		}
+	}
+	flight := &cacheFlight{done: make(chan struct{})}
+	c.flights[target] = flight
+	c.mu.Unlock()
+	// The owner performs the transfer synchronously so cancellation cannot
+	// return while its temporary-file cleanup is still racing the caller.
+	local, err := c.fill(ctx, dl, remotePath, node, target)
+	c.mu.Lock()
+	flight.path = local
+	flight.err = err
+	delete(c.flights, target)
+	close(flight.done)
+	c.mu.Unlock()
+	return local, err
+}
 
-		temp, err := os.CreateTemp(filepath.Dir(target), "download-*"+safeExt(remotePath))
-		if err != nil {
-			return "", err
-		}
-		tempPath := temp.Name()
-		if err := temp.Close(); err != nil {
-			_ = os.Remove(tempPath)
-			return "", err
-		}
+type cacheFlight struct {
+	done chan struct{}
+	path string
+	err  error
+}
 
-		if err := dl.DownloadToFile(ctx, remotePath, tempPath); err != nil {
-			_ = os.Remove(tempPath)
-			return "", err
-		}
-		if ok, err := cacheFileValid(tempPath, node.Size); err != nil {
-			_ = os.Remove(tempPath)
-			return "", err
-		} else if !ok {
-			_ = os.Remove(tempPath)
-			return "", fmt.Errorf("cached download size mismatch for %s", remotePath)
-		}
+func (c *fileCache) fill(ctx context.Context, dl downloader, remotePath string, node evs.Node, target string) (string, error) {
+	if err := ctx.Err(); err != nil {
+		return "", err
+	}
 
-		if err := os.Rename(tempPath, target); err != nil {
-			if ok, statErr := cacheFileValid(target, node.Size); statErr == nil && ok {
-				_ = os.Remove(tempPath)
-				return target, nil
-			}
-			_ = os.Remove(tempPath)
-			return "", err
-		}
-		return target, nil
-	})
+	if ok, err := cacheFileValid(target, node.Size); ok || err != nil {
+		return target, err
+	}
+	if err := os.MkdirAll(filepath.Dir(target), 0o700); err != nil {
+		return "", err
+	}
+
+	temp, err := os.CreateTemp(filepath.Dir(target), "download-*"+safeExt(remotePath))
 	if err != nil {
 		return "", err
 	}
-	return result.(string), nil
+	tempPath := temp.Name()
+	if err := temp.Close(); err != nil {
+		_ = os.Remove(tempPath)
+		return "", err
+	}
+
+	if err := dl.DownloadToFile(ctx, remotePath, tempPath); err != nil {
+		_ = os.Remove(tempPath)
+		return "", err
+	}
+	if ok, err := cacheFileValid(tempPath, node.Size); err != nil {
+		_ = os.Remove(tempPath)
+		return "", err
+	} else if !ok {
+		_ = os.Remove(tempPath)
+		return "", fmt.Errorf("cached download size mismatch for %s", remotePath)
+	}
+
+	if err := os.Rename(tempPath, target); err != nil {
+		if ok, statErr := cacheFileValid(target, node.Size); statErr == nil && ok {
+			_ = os.Remove(tempPath)
+			return target, nil
+		}
+		_ = os.Remove(tempPath)
+		return "", err
+	}
+	_ = pruneFiles(c.rootDir, target, configuredBytes("IDRIVE_GATEWAY_CACHE_MAX_BYTES"), retentionAge)
+	return target, nil
 }
 
 func (c *fileCache) targetPath(remotePath string, node evs.Node) string {

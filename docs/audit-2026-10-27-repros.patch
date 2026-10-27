@@ -1,0 +1,243 @@
+diff --git a/internal/evs/audit_test.go b/internal/evs/audit_test.go
+new file mode 100644
+--- /dev/null
++++ b/internal/evs/audit_test.go
+@@ -0,0 +1,87 @@
++package evs
++
++import (
++	"context"
++	"encoding/json"
++	"fmt"
++	"net/http"
++	"net/http/httptest"
++	"os"
++	"path/filepath"
++	"testing"
++	"time"
++)
++
++func auditClient(t *testing.T, handler http.HandlerFunc) *Client {
++	t.Helper()
++	s := httptest.NewServer(handler)
++	t.Cleanup(s.Close)
++	c, err := NewClient("audit.invalid", nil)
++	if err != nil {
++		t.Fatal(err)
++	}
++	c.baseURL = s.URL
++	return c
++}
++
++func TestAuditCopyRefreshesCachedDestination(t *testing.T) {
++	copied := false
++	browses := 0
++	c := auditClient(t, func(w http.ResponseWriter, r *http.Request) {
++		switch r.URL.Path {
++		case "/evs/browseFolder":
++			browses++
++			contents := []map[string]any{}
++			if copied {
++				contents = append(contents, map[string]any{"name": "source.txt", "size": "3"})
++			}
++			json.NewEncoder(w).Encode(map[string]any{"message": "SUCCESS", "path": "/dest", "contents": contents})
++		case "/evs/copyPasteFileFolder":
++			copied = true
++			fmt.Fprint(w, `{"message":"SUCCESS"}`)
++		default:
++			t.Errorf("unexpected endpoint %s", r.URL.Path)
++		}
++	})
++	if _, err := c.Browse(context.Background(), "/dest"); err != nil {
++		t.Fatal(err)
++	}
++	ctx, cancel := context.WithTimeout(context.Background(), 150*time.Millisecond)
++	defer cancel()
++	if err := c.Copy(ctx, "/source.txt", "/dest"); err != nil {
++		t.Fatalf("copy was completed upstream but returned %v; browse calls=%d (cached destination was never refreshed)", err, browses)
++	}
++}
++
++func TestAuditFailedOverwritePreservesOriginal(t *testing.T) {
++	deleted := false
++	c := auditClient(t, func(w http.ResponseWriter, r *http.Request) {
++		switch r.URL.Path {
++		case "/evs/browseFolder":
++			fmt.Fprint(w, `{"message":"SUCCESS","path":"/","contents":[{"name":"old.txt","size":"8"}]}`)
++		case "/evs/v1/deleteFile":
++			deleted = true
++			fmt.Fprint(w, `{"message":"SUCCESS"}`)
++		case "/evs/web/upload":
++			http.Error(w, "injected upload failure", http.StatusServiceUnavailable)
++		default:
++			t.Errorf("unexpected endpoint %s", r.URL.Path)
++		}
++	})
++	local := filepath.Join(t.TempDir(), "replacement.txt")
++	if err := os.WriteFile(local, []byte("new data"), 0600); err != nil {
++		t.Fatal(err)
++	}
++	if err := c.UploadFile(context.Background(), local, "/old.txt", time.Now()); err == nil {
++		t.Fatal("expected injected upload failure")
++	}
++	if deleted {
++		t.Fatal("original file was permanently deleted before replacement upload failed")
++	}
++}
++
++func TestAuditHTMLUploadReplyIsRejected(t *testing.T) {
++	if err := checkMaybeJSONReply([]byte(`<html><form action="/login">session expired</form></html>`)); err == nil {
++		t.Fatal("HTTP 200 login HTML is accepted as successful upload/delete/copy/move response")
++	}
++}
+diff --git a/internal/session/audit_test.go b/internal/session/audit_test.go
+new file mode 100644
+--- /dev/null
++++ b/internal/session/audit_test.go
+@@ -0,0 +1,45 @@
++package session
++
++import (
++	"net/http"
++	"net/http/cookiejar"
++	"net/url"
++	"os"
++	"path/filepath"
++	"testing"
++)
++
++func TestAuditSaveRestrictsExistingSessionFile(t *testing.T) {
++	p := filepath.Join(t.TempDir(), "session.json")
++	if err := os.WriteFile(p, []byte("{}"), 0644); err != nil {
++		t.Fatal(err)
++	}
++	s := &Store{Path: p}
++	if err := s.Save(&Data{ServerHost: "example.com"}); err != nil {
++		t.Fatal(err)
++	}
++	info, err := os.Stat(p)
++	if err != nil {
++		t.Fatal(err)
++	}
++	if info.Mode().Perm() != 0600 {
++		t.Fatalf("saved authentication cookies retain permissions %o, want 600", info.Mode().Perm())
++	}
++}
++
++func TestAuditCookieRoundTripPreservesSameNameDifferentPaths(t *testing.T) {
++	jar, _ := cookiejar.New(nil)
++	u, _ := url.Parse("https://example.com/evs/")
++	jar.SetCookies(u, []*http.Cookie{{Name: "SESSION", Value: "root", Path: "/"}, {Name: "SESSION", Value: "evs", Path: "/evs/"}})
++	data, err := FromCookieJar("example.com", jar)
++	if err != nil {
++		t.Fatal(err)
++	}
++	restored, err := data.NewCookieJar()
++	if err != nil {
++		t.Fatal(err)
++	}
++	if got := restored.Cookies(u); len(got) != 2 {
++		t.Fatalf("cookie round trip lost path-specific session: got %v, want both root and EVS values", got)
++	}
++}
+diff --git a/internal/webdav/audit_test.go b/internal/webdav/audit_test.go
+new file mode 100644
+--- /dev/null
++++ b/internal/webdav/audit_test.go
+@@ -0,0 +1,96 @@
++package idrivewebdav
++
++import (
++	"context"
++	"io"
++	"net/http"
++	"net/http/cookiejar"
++	"net/http/httptest"
++	"net/url"
++	"os"
++	"strings"
++	"testing"
++	"time"
++
++	netwebdav "golang.org/x/net/webdav"
++	"idrive-unlimited/internal/evs"
++)
++
++func TestAuditCacheSeparatesAccountsOnSameServer(t *testing.T) {
++	t.Setenv(cacheDirEnv, t.TempDir())
++	newAccount := func(value string) *FileSystem {
++		jar, _ := cookiejar.New(nil)
++		u, _ := url.Parse("https://same-server.idrive.com/")
++		jar.SetCookies(u, []*http.Cookie{{Name: "EVSID", Value: value}})
++		c, _ := evs.NewClient(u.Host, jar)
++		return New(c, "/")
++	}
++	a, b := newAccount("account-a"), newAccount("account-b")
++	node := evs.Node{Path: "/test.txt", Name: "test.txt", Size: 5, Version: "1", ModTime: time.Unix(1700000000, 0)}
++	if _, err := a.cache.Ensure(context.Background(), &fakeDownloader{payload: []byte("ALICE")}, node.Path, node); err != nil {
++		t.Fatal(err)
++	}
++	dl := &fakeDownloader{payload: []byte("BOB!!")}
++	p, err := b.cache.Ensure(context.Background(), dl, node.Path, node)
++	if err != nil {
++		t.Fatal(err)
++	}
++	got, err := os.ReadFile(p)
++	if err != nil {
++		t.Fatal(err)
++	}
++	if string(got) != "BOB!!" {
++		t.Fatalf("account B read account A's cached data %q; B downloads=%d", got, dl.calls)
++	}
++}
++
++type auditBrokenBody struct{ sent bool }
++
++func (b *auditBrokenBody) Read(p []byte) (int, error) {
++	if b.sent {
++		return 0, io.ErrUnexpectedEOF
++	}
++	b.sent = true
++	return copy(p, "partial"), nil
++}
++func (b *auditBrokenBody) Close() error { return nil }
++
++func TestAuditInterruptedPutDoesNotUploadPartialData(t *testing.T) {
++	uploaded := ""
++	s := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		switch r.URL.Path {
++		case "/evs/browseFolder":
++			io.WriteString(w, `{"message":"SUCCESS","path":"/","contents":[]}`)
++		case "/evs/web/upload":
++			if err := r.ParseMultipartForm(1024 * 1024); err != nil {
++				t.Error(err)
++				return
++			}
++			f, _, err := r.FormFile("file")
++			if err != nil {
++				t.Error(err)
++				return
++			}
++			defer f.Close()
++			data, _ := io.ReadAll(f)
++			uploaded = string(data)
++			io.WriteString(w, `{"message":"SUCCESS"}`)
++		default:
++			t.Errorf("unexpected endpoint %s", r.URL.Path)
++		}
++	}))
++	defer s.Close()
++	oldTransport := http.DefaultTransport
++	http.DefaultTransport = s.Client().Transport
++	defer func() { http.DefaultTransport = oldTransport }()
++	c, _ := evs.NewClient(strings.TrimPrefix(s.URL, "https://"), nil)
++	h := &netwebdav.Handler{FileSystem: New(c, "/"), LockSystem: netwebdav.NewMemLS()}
++	r := httptest.NewRequest(http.MethodPut, "http://gateway/new.txt", nil)
++	r.Body = &auditBrokenBody{}
++	r.ContentLength = 100
++	w := httptest.NewRecorder()
++	h.ServeHTTP(w, r)
++	if uploaded != "" {
++		t.Fatalf("aborted PUT returned HTTP %d but committed partial remote content %q", w.Code, uploaded)
++	}
++}

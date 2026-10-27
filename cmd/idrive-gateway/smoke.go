@@ -3,25 +3,27 @@ package main
 import (
 	"bytes"
 	"context"
+	"errors"
 	"flag"
 	"fmt"
+	"idrive-unlimited/internal/evs"
 	"net"
 	"net/http"
 	"os"
 	"os/exec"
+	"path"
 	"path/filepath"
 	"runtime"
 	"strings"
 	"time"
 
 	idrivewebdav "idrive-unlimited/internal/webdav"
-
-	netwebdav "golang.org/x/net/webdav"
 )
 
-func runSmoke(ctx context.Context, args []string) error {
+func runSmoke(ctx context.Context, args []string) (runErr error) {
 	fs := flag.NewFlagSet("smoke", flag.ContinueOnError)
 	storePath := fs.String("config", "", "session file path")
+	noLogin := fs.Bool("no-login", false, "fail instead of opening a login window")
 	rootPath := fs.String("root", "/", "mounted root path inside Cloud Backup")
 	mountDrive := fs.String("mount-drive", "", "optional Windows drive letter for a temporary rclone mount, for example X:")
 	browsePath := fs.String("browse-path", "", "optional mounted path to time after mount, for example /Phone Backup/Photos")
@@ -33,11 +35,15 @@ func runSmoke(ctx context.Context, args []string) error {
 		return fmt.Errorf("rclone not found in PATH: %w", err)
 	}
 
-	client, _, err := ensureClient(ctx, *storePath, true)
+	client, _, err := ensureClient(ctx, *storePath, !*noLogin)
 	if err != nil {
 		return err
 	}
 
+	password, err := randomSecret(24)
+	if err != nil {
+		return err
+	}
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		return err
@@ -45,10 +51,7 @@ func runSmoke(ctx context.Context, args []string) error {
 	defer listener.Close()
 
 	server := &http.Server{
-		Handler: basicAuth("idrive", "localtest123", &netwebdav.Handler{
-			FileSystem: idrivewebdav.New(client, *rootPath),
-			LockSystem: netwebdav.NewMemLS(),
-		}),
+		Handler:           basicAuth("idrive", password, idrivewebdav.NewHandler(idrivewebdav.New(client, *rootPath), nil)),
 		ReadHeaderTimeout: 15 * time.Second,
 	}
 
@@ -80,7 +83,7 @@ func runSmoke(ctx context.Context, args []string) error {
 		return err
 	}
 
-	obscuredPass, err := runCommandCapture(ctx, "", "rclone", "obscure", "localtest123")
+	obscuredPass, err := runCommandCapture(ctx, "", "rclone", "obscure", password)
 	if err != nil {
 		return err
 	}
@@ -124,7 +127,30 @@ func runSmoke(ctx context.Context, args []string) error {
 		fmt.Printf("rclone lsf %s succeeded in %s with %d entries.\n", browseTarget, listElapsed.Round(time.Millisecond), lines)
 	}
 
-	remoteDir := "/rclone-smoke-" + time.Now().UTC().Format("20060102t150405")
+	suffix, err := randomSecret(8)
+	if err != nil {
+		return err
+	}
+	remoteDir := "/rclone-smoke-" + time.Now().UTC().Format("20060102t150405") + "-" + suffix
+	cleaned := false
+	defer func() {
+		if cleaned {
+			return
+		}
+		cleanup, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		target := path.Join(*rootPath, strings.TrimPrefix(remoteDir, "/"))
+		_, err := client.StatFresh(cleanup, target)
+		if errors.Is(err, evs.ErrNotFound) {
+			return
+		}
+		if err == nil {
+			err = client.Delete(cleanup, target)
+		}
+		if err != nil {
+			runErr = errors.Join(runErr, fmt.Errorf("smoke cleanup %s: %w", target, err))
+		}
+	}()
 	remoteFile := "idrive-smoke:" + remoteDir + "/smoke.txt"
 	remoteRenamed := "idrive-smoke:" + remoteDir + "/smoke-renamed.txt"
 
@@ -166,6 +192,7 @@ func runSmoke(ctx context.Context, args []string) error {
 		fmt.Printf("rclone %s succeeded.\n", step.label)
 	}
 
+	cleaned = true
 	if drive := strings.TrimSpace(*mountDrive); drive != "" {
 		if err := runMountSmoke(ctx, configPath, drive, *browsePath); err != nil {
 			return err
@@ -192,7 +219,7 @@ func runMountSmoke(ctx context.Context, configPath, drive, browsePath string) er
 		return fmt.Errorf("mount drive %s is already in use", mountPath)
 	}
 
-	mountCtx, cancel := context.WithCancel(context.Background())
+	mountCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
 	cmd := exec.CommandContext(mountCtx, "rclone",

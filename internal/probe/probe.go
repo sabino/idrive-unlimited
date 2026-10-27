@@ -31,11 +31,11 @@ type Report struct {
 	Steps       []Step    `json:"steps"`
 }
 
-func Run(ctx context.Context, client *evs.Client, rootPath, scratchPath string) (*Report, error) {
+func Run(ctx context.Context, client *evs.Client, rootPath, scratchPath string) (report *Report, runErr error) {
 	root := evs.CleanPath(rootPath)
 	scratch := allocateScratch(resolveScratch(root, scratchPath))
 
-	report := &Report{
+	report = &Report{
 		RootPath:    root,
 		ScratchPath: scratch,
 		StartedAt:   time.Now().UTC(),
@@ -74,8 +74,25 @@ func Run(ctx context.Context, client *evs.Client, rootPath, scratchPath string) 
 		return report, err
 	}
 	record("mkdir-scratch", nil, scratch)
+	cleaned := false
 	defer func() {
-		_ = client.Delete(context.Background(), scratch)
+		if cleaned {
+			return
+		}
+		cleanup, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		_, err := client.StatFresh(cleanup, scratch)
+		if errors.Is(err, evs.ErrNotFound) {
+			return
+		}
+		if err == nil {
+			err = client.Delete(cleanup, scratch)
+		}
+		if err != nil {
+			record("cleanup-after-failure", err, scratch)
+			report.Success = false
+			runErr = errors.Join(runErr, fmt.Errorf("scratch cleanup %s: %w", scratch, err))
+		}
 	}()
 
 	smallLocal, smallHash, err := writeTempFile("idrive-gateway-small-", 256*1024+321)
@@ -166,17 +183,21 @@ func Run(ctx context.Context, client *evs.Client, rootPath, scratchPath string) 
 	}
 	record("download-verify", nil, movedChunk)
 
-	if info, err := client.Stat(ctx, copiedSmall); err != nil {
-		record("stat-copied-small", err, "")
-		report.Success = false
-		return report, err
-	} else if info.Size == 0 {
-		err := fmt.Errorf("copied file size is zero")
-		record("stat-copied-small", err, "")
-		report.Success = false
+	copiedDownload := smallLocal + ".download"
+	defer os.Remove(copiedDownload)
+	if err := client.DownloadToFile(ctx, copiedSmall, copiedDownload); err != nil {
+		record("verify-copied-small", err, "")
 		return report, err
 	}
-	record("stat-copied-small", nil, copiedSmall)
+	copiedHash, err := md5File(copiedDownload)
+	if err == nil && copiedHash != smallHash {
+		err = fmt.Errorf("copied small file checksum mismatch")
+	}
+	if err != nil {
+		record("verify-copied-small", err, "")
+		return report, err
+	}
+	record("verify-copied-small", nil, copiedSmall)
 
 	cleanupTargets := []string{copiedSmall, movedChunk, destDir, renamedSmall, scratch}
 	for _, target := range cleanupTargets {
@@ -188,12 +209,14 @@ func Run(ctx context.Context, client *evs.Client, rootPath, scratchPath string) 
 		record("cleanup-"+path.Base(target), nil, target)
 	}
 
-	if info, err := client.Stat(ctx, scratch); err == nil {
-		err = fmt.Errorf("scratch path still exists after cleanup: %s", info.Path)
+	if _, err := client.StatFresh(ctx, scratch); !errors.Is(err, evs.ErrNotFound) {
+		if err == nil {
+			err = fmt.Errorf("scratch path still exists after cleanup")
+		}
 		record("cleanup-verify", err, "")
-		report.Success = false
 		return report, err
 	}
+	cleaned = true
 	record("cleanup-verify", nil, scratch)
 
 	if smallHash == "" || chunkHash == "" {

@@ -3,6 +3,7 @@ package idrivewebdav
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"io/fs"
 	"os"
@@ -26,7 +27,7 @@ func New(client *evs.Client, root string) *FileSystem {
 	return &FileSystem{
 		client: client,
 		root:   CleanPath(root),
-		cache:  newFileCache(client.ServerHost() + "|" + CleanPath(root)),
+		cache:  newFileCache(client.CacheIdentity() + "|" + CleanPath(root)),
 	}
 }
 
@@ -68,6 +69,7 @@ func (f *FileSystem) OpenFile(ctx context.Context, name string, flag int, _ os.F
 	if err != nil {
 		return nil, mapError("open", name, err)
 	}
+	file.ctx = ctx
 	return file, nil
 }
 
@@ -245,6 +247,8 @@ type readFile struct {
 	mu          sync.Mutex
 	file        *os.File
 	pendingSeek int64
+	ctx         context.Context
+	closed      bool
 }
 
 func newReadFile(client downloader, cache *fileCache, remotePath string, node evs.Node, info os.FileInfo) (*readFile, error) {
@@ -260,6 +264,7 @@ func newReadFile(client downloader, cache *fileCache, remotePath string, node ev
 func (f *readFile) Close() error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	f.closed = true
 	if f.file == nil {
 		return nil
 	}
@@ -269,19 +274,25 @@ func (f *readFile) Close() error {
 }
 
 func (f *readFile) Read(p []byte) (int, error) {
-	file, err := f.ensureLocal(context.Background())
+	file, err := f.ensureLocal(f.requestContext())
 	if err != nil {
+		stateFrom(f.requestContext()).fail(err)
 		return 0, err
 	}
-	return file.Read(p)
+	n, err := file.Read(p)
+	stateFrom(f.requestContext()).fail(err)
+	return n, err
 }
 
 func (f *readFile) ReadAt(p []byte, off int64) (int, error) {
-	file, err := f.ensureLocal(context.Background())
+	file, err := f.ensureLocal(f.requestContext())
 	if err != nil {
+		stateFrom(f.requestContext()).fail(err)
 		return 0, err
 	}
-	return file.ReadAt(p, off)
+	n, err := file.ReadAt(p, off)
+	stateFrom(f.requestContext()).fail(err)
+	return n, err
 }
 
 func (f *readFile) Seek(off int64, whence int) (int64, error) {
@@ -317,8 +328,18 @@ func (f *readFile) Write([]byte) (int, error)          { return 0, fs.ErrPermiss
 func (f *readFile) Readdir(int) ([]os.FileInfo, error) { return nil, fs.ErrInvalid }
 func (f *readFile) Stat() (os.FileInfo, error)         { return f.info, nil }
 
+func (f *readFile) requestContext() context.Context {
+	if f.ctx != nil {
+		return f.ctx
+	}
+	return context.Background()
+}
 func (f *readFile) ensureLocal(ctx context.Context) (*os.File, error) {
 	f.mu.Lock()
+	if f.closed {
+		f.mu.Unlock()
+		return nil, fs.ErrClosed
+	}
 	if f.file != nil {
 		file := f.file
 		f.mu.Unlock()
@@ -345,6 +366,10 @@ func (f *readFile) ensureLocal(ctx context.Context) (*os.File, error) {
 
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if f.closed {
+		file.Close()
+		return nil, fs.ErrClosed
+	}
 	if f.file != nil {
 		_ = file.Close()
 		return f.file, nil
@@ -360,6 +385,7 @@ type writeFile struct {
 	tempPath      string
 	commitOnClose bool
 	dirty         bool
+	ctx           context.Context
 }
 
 func newWriteFile(ctx context.Context, client *evs.Client, remotePath string, flag int) (*writeFile, error) {
@@ -369,6 +395,7 @@ func newWriteFile(ctx context.Context, client *evs.Client, remotePath string, fl
 	}
 
 	wf := &writeFile{
+		ctx:        ctx,
 		client:     client,
 		remotePath: remotePath,
 		file:       temp,
@@ -393,7 +420,7 @@ func newWriteFile(ctx context.Context, client *evs.Client, remotePath string, fl
 			}
 			temp, err = os.OpenFile(temp.Name(), os.O_RDWR, 0o600)
 			if err != nil {
-				os.Remove(temp.Name())
+				os.Remove(wf.tempPath)
 				return nil, err
 			}
 			wf.file = temp
@@ -439,15 +466,26 @@ func newWriteFile(ctx context.Context, client *evs.Client, remotePath string, fl
 }
 
 func (f *writeFile) Close() error {
-	closeErr := f.file.Close()
-	defer os.Remove(f.tempPath)
-	if closeErr != nil {
-		return closeErr
+	if err := f.file.Close(); err != nil {
+		os.Remove(f.tempPath)
+		return err
 	}
 	if !f.dirty && !f.commitOnClose {
+		os.Remove(f.tempPath)
 		return nil
 	}
-	return f.client.UploadFile(context.Background(), f.tempPath, f.remotePath, time.Now())
+	if err := errors.Join(f.ctx.Err(), stateFrom(f.ctx).complete()); err != nil {
+		os.Remove(f.tempPath)
+		return err
+	}
+	if err := f.client.UploadFile(f.ctx, f.tempPath, f.remotePath, time.Now()); err != nil {
+		saved, saveErr := retainUpload(f.tempPath, f.remotePath, err)
+		if saveErr == nil {
+			os.Remove(f.tempPath)
+		}
+		return fmt.Errorf("%w; local recovery copy: %s (retention error: %v)", err, saved, saveErr)
+	}
+	return os.Remove(f.tempPath)
 }
 
 func (f *writeFile) Read(p []byte) (int, error)              { return f.file.Read(p) }
@@ -457,7 +495,14 @@ func (f *writeFile) Seek(off int64, whence int) (int64, error) {
 }
 
 func (f *writeFile) Write(p []byte) (int, error) {
+	if info, err := f.file.Stat(); err != nil {
+		return 0, err
+	} else if info.Size()+int64(len(p)) > evs.MaxUploadSize {
+		stateFrom(f.ctx).fail(evs.ErrFileTooLarge)
+		return 0, evs.ErrFileTooLarge
+	}
 	n, err := f.file.Write(p)
+	stateFrom(f.ctx).fail(err)
 	if n > 0 {
 		f.dirty = true
 	}

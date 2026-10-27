@@ -1,12 +1,11 @@
 package session
 
 import (
-	"net/http/cookiejar"
 	"testing"
 )
 
 func TestFromCookieJarIncludesPathScopedEVSCookies(t *testing.T) {
-	jar, err := cookiejar.New(nil)
+	jar, err := NewJar()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -83,7 +82,7 @@ func TestApplyToJarSupportsPathScopedCookies(t *testing.T) {
 }
 
 func TestFromCookieJarDeduplicatesAcrossPaths(t *testing.T) {
-	jar, err := cookiejar.New(nil)
+	jar, err := NewJar()
 	if err != nil {
 		t.Fatal(err)
 	}
